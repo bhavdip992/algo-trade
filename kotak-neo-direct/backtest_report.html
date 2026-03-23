@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Backtest Report</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f1117; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; padding: 24px; }
+  h1 { color: #f97316; font-size: 22px; margin-bottom: 6px; }
+  h2 { color: #94a3b8; font-size: 14px; font-weight: 400; margin-bottom: 24px; }
+  h3 { color: #cbd5e1; font-size: 15px; margin: 24px 0 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: #1e2433; border: 1px solid #2d3748; border-radius: 10px; padding: 16px; }
+  .card .label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+  .card .value { font-size: 22px; font-weight: 600; }
+  .green { color: #4ade80; }
+  .red { color: #f87171; }
+  .orange { color: #fb923c; }
+  .white { color: #f1f5f9; }
+  .chart-wrap { background: #1e2433; border: 1px solid #2d3748; border-radius: 10px; padding: 16px; margin-bottom: 24px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { background: #1e2433; color: #94a3b8; padding: 8px 10px; text-align: left; border-bottom: 1px solid #2d3748; position: sticky; top: 0; }
+  td { padding: 7px 10px; border-bottom: 1px solid #1a2030; }
+  .badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge.ce { background: #052e16; color: #4ade80; }
+  .badge.pe { background: #450a0a; color: #f87171; }
+  .tbl-wrap { background: #1e2433; border: 1px solid #2d3748; border-radius: 10px; overflow: auto; max-height: 500px; }
+  .params { background: #1e2433; border: 1px solid #2d3748; border-radius: 10px; padding: 16px; margin-bottom: 24px; font-size: 12px; color: #94a3b8; line-height: 1.8; }
+</style>
+</head>
+<body>
+<h1>Backtest Report — 3 Trades</h1>
+<h2>Generated: 23 Mar 2026 20:57 | Capital: Rs.20,000</h2>
+
+<div class="grid">
+  <div class="card"><div class="label">Total P&L</div>
+    <div class="value green">
+      Rs.1,579</div></div>
+  <div class="card"><div class="label">Win Rate</div>
+    <div class="value green">100.0%</div></div>
+  <div class="card"><div class="label">Profit Factor</div>
+    <div class="value green">1579.2</div></div>
+  <div class="card"><div class="label">Max Drawdown</div>
+    <div class="value red">0.0%</div></div>
+  <div class="card"><div class="label">Sharpe Ratio</div>
+    <div class="value orange">0</div></div>
+  <div class="card"><div class="label">Risk:Reward</div>
+    <div class="value orange">0</div></div>
+  <div class="card"><div class="label">Total Trades</div>
+    <div class="value white">3</div></div>
+  <div class="card"><div class="label">Final Capital</div>
+    <div class="value white">Rs.21,579</div></div>
+</div>
+
+<div class="chart-wrap">
+  <h3>Equity Curve</h3>
+  <div style="height:260px"><canvas id="equityChart"></canvas></div>
+</div>
+
+<div class="chart-wrap">
+  <h3>Monthly P&L</h3>
+  <div style="height:200px"><canvas id="monthlyChart"></canvas></div>
+</div>
+
+<h3>All Trades</h3>
+<div class="tbl-wrap">
+<table>
+  <thead><tr>
+    <th>#</th><th>Entry</th><th>Exit</th><th>Signal</th>
+    <th>Entry Px</th><th>Exit Px</th><th>SL</th><th>Target</th>
+    <th>Lots</th><th>P&L</th><th>Exit Reason</th><th>Conf</th><th>Duration</th>
+  </tr></thead>
+  <tbody>
+        <tr style="background:#1a3a2a">
+            <td>3</td>
+            <td>23-Mar 14:15</td>
+            <td>23-Mar 14:40</td>
+            <td><span class="badge pe">BUY_PE</span></td>
+            <td>22564</td>
+            <td>22547</td>
+            <td>22573</td>
+            <td>22547</td>
+            <td>1</td>
+            <td style="color:#4ade80">+Rs.532</td>
+            <td>TARGET</td>
+            <td>6/8</td>
+            <td>25m</td>
+        </tr>
+        <tr style="background:#1a3a2a">
+            <td>2</td>
+            <td>23-Mar 13:50</td>
+            <td>23-Mar 14:15</td>
+            <td><span class="badge pe">BUY_PE</span></td>
+            <td>22588</td>
+            <td>22571</td>
+            <td>22596</td>
+            <td>22571</td>
+            <td>1</td>
+            <td style="color:#4ade80">+Rs.511</td>
+            <td>TARGET</td>
+            <td>5/8</td>
+            <td>25m</td>
+        </tr>
+        <tr style="background:#1a3a2a">
+            <td>1</td>
+            <td>23-Mar 13:20</td>
+            <td>23-Mar 13:50</td>
+            <td><span class="badge pe">BUY_PE</span></td>
+            <td>22609</td>
+            <td>22592</td>
+            <td>22618</td>
+            <td>22592</td>
+            <td>1</td>
+            <td style="color:#4ade80">+Rs.536</td>
+            <td>TARGET</td>
+            <td>5/8</td>
+            <td>30m</td>
+        </tr></tbody>
+</table>
+</div>
+
+<div class="params" style="margin-top:24px">
+  <b style="color:#cbd5e1">Strategy Parameters (v3 Engine):</b><br>
+  EMA: 9/21/50/200 &nbsp;|&nbsp;
+  Supertrend: 2.5×10 &nbsp;|&nbsp;
+  RSI: 14 (35–65) &nbsp;|&nbsp;
+  ADX: 20 &nbsp;|&nbsp;
+  Vol: 1.2× &nbsp;|&nbsp;
+  SL: ATR 1.2× &nbsp;|&nbsp;
+  Trail: GREEDY — Breakeven@0.8×ATR | Normal@1.0×ATR | Tight@0.5×ATR (after 2.0×ATR profit) &nbsp;|&nbsp;
+  Capital: Rs.20,000 | Risk: 2.0%
+</div>
+
+<script>
+const eq_labels = ["2026-03-23", "2026-03-23", "2026-03-23"];
+const eq_values = [20535.8, 21047.0, 21579.2];
+const mo_labels = ["2026-03"];
+const mo_values = [1579.2];
+const mo_colors = ['#1D9E75'];
+
+new Chart(document.getElementById('equityChart'), {
+  type: 'line',
+  data: { labels: eq_labels, datasets: [{
+    label: 'Equity', data: eq_values,
+    borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.08)',
+    borderWidth: 2, pointRadius: 0, fill: true, tension: 0.3
+  }]},
+  options: { responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{display:false} },
+    scales:{ x:{ticks:{color:'#64748b',maxTicksLimit:8},grid:{color:'#1e2d3d'}},
+              y:{ticks:{color:'#64748b'},grid:{color:'#1e2d3d'}} } }
+});
+
+new Chart(document.getElementById('monthlyChart'), {
+  type: 'bar',
+  data: { labels: mo_labels, datasets: [{
+    label: 'Monthly P&L', data: mo_values, backgroundColor: mo_colors, borderRadius: 4
+  }]},
+  options: { responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{display:false} },
+    scales:{ x:{ticks:{color:'#64748b'},grid:{color:'#1e2d3d'}},
+              y:{ticks:{color:'#64748b'},grid:{color:'#1e2d3d'}} } }
+});
+</script>
+</body></html>
