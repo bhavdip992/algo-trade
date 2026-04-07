@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║   🇮🇳 INDIA OPTIONS AUTO-TRADER — Kotak Neo API Bridge v4.0 FIXED   ║
-║   TradingView Webhook / kotak_live.py → Kotak Neo SDK v2             ║
-║                                                                      ║
-║   FIXES vs v3:                                                       ║
-║     1. session_ok auto-set to True after login (was blocking trades) ║
-║     2. LOT_SIZES unified: BANKNIFTY=30, NIFTY=75 (NSE 2024)         ║
-║     3. Option premium cap: won't buy > ₹500 premium (protects 20k)  ║
-║     4. Auto lot size calculation based on available capital          ║
-║     5. Better option symbol fallback if ATM not found               ║
-║     6. /webhook now also accepts SQUAREOFF_ALL action               ║
-╚══════════════════════════════════════════════════════════════════════╝
+#======================================================================#
+=   [IN] INDIA OPTIONS AUTO-TRADER -- Kotak Neo API Bridge v4.0 FIXED   =
+=   TradingView Webhook / kotak_live.py -> Kotak Neo SDK v2             =
+=                                                                      =
+=   FIXES vs v3:                                                       =
+=     1. session_ok auto-set to True after login (was blocking trades) =
+=     2. LOT_SIZES unified: BANKNIFTY=30, NIFTY=75 (NSE 2024)         =
+=     3. Option premium cap: won't buy > Rs.500 premium (protects 20k)  =
+=     4. Auto lot size calculation based on available capital          =
+=     5. Better option symbol fallback if ATM not found               =
+=     6. /webhook now also accepts SQUAREOFF_ALL action               =
+#======================================================================#
 
 INSTALL:
     pip install flask pyotp python-dotenv
@@ -40,23 +40,31 @@ load_dotenv()
 
 from neo_api_client import NeoAPI
 
-# ─────────────────────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("kotak_trader.log"),
-    ]
+# -------------------------------------------------------------
+# LOGGING  -- UTF-8 forced on all handlers (fixes Windows CP1252 crash)
+# -------------------------------------------------------------
+import sys as _sys
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+_stream_handler = logging.StreamHandler(
+    stream=open(_sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1, closefd=False)
 )
+_stream_handler.setFormatter(_fmt)
+
+_file_handler = logging.FileHandler("kotak_trader.log", encoding="utf-8")
+_file_handler.setFormatter(_fmt)
+
+logging.root.setLevel(logging.INFO)
+logging.root.handlers = []
+logging.root.addHandler(_stream_handler)
+logging.root.addHandler(_file_handler)
+
 log = logging.getLogger("KotakTrader")
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # CONFIG
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 CFG = {
     "consumer_key":    os.getenv("KOTAK_CONSUMER_KEY",  ""),
     "mobile":          os.getenv("KOTAK_MOBILE",         ""),
@@ -74,10 +82,10 @@ CFG = {
     "max_premium":     float(os.getenv("MAX_PREMIUM",    "500")),
 }
 
-# ── FIXED LOT SIZES (NSE F&O 2024 revision) ─────────────────
+# -- FIXED LOT SIZES (NSE F&O 2024 revision) -----------------
 # Source: NSE circular Oct 2024
 LOT_SIZES = {
-    "NIFTY":       75,
+    "NIFTY":       65,
     "BANKNIFTY":   30,
     "FINNIFTY":    65,
     "MIDCPNIFTY":  120,
@@ -99,9 +107,9 @@ STRIKE_STEPS = {
 }
 
 
-# ─────────────────────────────────────────────────────────────
-# KOTAK NEO CLIENT — singleton with auto-login
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
+# KOTAK NEO CLIENT -- singleton with auto-login
+# -------------------------------------------------------------
 class KotakNeoClient:
     _instance   = None
     _lock       = threading.Lock()
@@ -124,17 +132,17 @@ class KotakNeoClient:
         if not CFG["totp_secret"]:
             raise ValueError("KOTAK_TOTP_SECRET not set in .env")
         code = pyotp.TOTP(CFG["totp_secret"]).now()
-        log.info(f"🔐 TOTP: {code}")
+        log.info(f"[TOTP] TOTP: {code}")
         return code
 
     def login(self) -> bool:
         """
-        Full login: init → TOTP → MPIN.
+        Full login: init -> TOTP -> MPIN.
         Returns True on success.
         FIX: now updates state.session_ok directly.
         """
         with self._session_lock:
-            log.info("🔑 Logging into Kotak Neo...")
+            log.info("[LOGIN] Logging into Kotak Neo...")
             self._client = NeoAPI(
                 consumer_key=CFG["consumer_key"],
                 environment=CFG["environment"],
@@ -165,7 +173,7 @@ class KotakNeoClient:
             with state_lock:
                 state.session_ok = True
 
-            log.info("✅ Kotak Neo login successful")
+            log.info("[OK] Kotak Neo login successful")
             return True
 
     def ensure_logged_in(self):
@@ -176,7 +184,7 @@ class KotakNeoClient:
         if self._login_time:
             age_h = (datetime.now() - self._login_time).seconds / 3600
             if age_h > 7:
-                log.info("🔄 Session near expiry — refreshing")
+                log.info("[REFRESH] Session near expiry -- refreshing")
                 self.login()
 
     @property
@@ -188,9 +196,9 @@ class KotakNeoClient:
 neo_client = KotakNeoClient.get()
 
 
-# ─────────────────────────────────────────────────────────────
-# BROKER — all Kotak Neo interactions
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
+# BROKER -- all Kotak Neo interactions
+# -------------------------------------------------------------
 class KotakNeoBroker:
     _scrip_cache: dict = {}
     _cache_date:  date = None
@@ -198,7 +206,7 @@ class KotakNeoBroker:
     def _client(self) -> NeoAPI:
         return neo_client.client
 
-    # ── Instrument token lookup ──────────────────────────────
+    # -- Instrument token lookup ------------------------------
     def get_scrip_token(self, trading_symbol: str) -> str:
         today = date.today()
         if self._cache_date != today:
@@ -224,7 +232,7 @@ class KotakNeoBroker:
             log.error(f"Scrip token lookup failed ({trading_symbol}): {e}")
         return ""
 
-    # ── LTP ─────────────────────────────────────────────────
+    # -- LTP -------------------------------------------------
     def get_ltp(self, trading_symbol: str) -> float:
         try:
             token = self.get_scrip_token(trading_symbol)
@@ -242,13 +250,13 @@ class KotakNeoBroker:
                     resp["data"][0].get("ltp", 0) or
                     resp["data"][0].get("ltP", 0) or 0
                 )
-                log.debug(f"LTP {trading_symbol}: ₹{ltp}")
+                log.debug(f"LTP {trading_symbol}: Rs.{ltp}")
                 return ltp
         except Exception as e:
             log.error(f"LTP fetch failed ({trading_symbol}): {e}")
         return 0.0
 
-    # ── Funds / margin ───────────────────────────────────────
+    # -- Funds / margin ---------------------------------------
     def get_funds(self) -> dict:
         try:
             resp = self._client().limits(segment="FO", exchange="NFO", product="MIS")
@@ -264,7 +272,7 @@ class KotakNeoBroker:
             log.error(f"Funds fetch failed: {e}")
         return {"available": CFG["max_capital"]}
 
-    # ── Place order ──────────────────────────────────────────
+    # -- Place order ------------------------------------------
     def place_order(
         self,
         trading_symbol: str,
@@ -277,7 +285,7 @@ class KotakNeoBroker:
     ) -> str:
         if CFG["paper_trade"]:
             oid = f"PAPER_{int(time.time())}"
-            log.info(f"[PAPER] {transaction_type} {qty}×{trading_symbol} @ {order_type} → {oid}")
+            log.info(f"[PAPER] {transaction_type} {qty}×{trading_symbol} @ {order_type} -> {oid}")
             return oid
         try:
             resp = self._client().place_order(
@@ -299,14 +307,14 @@ class KotakNeoBroker:
             log.info(f"Order response: {resp}")
             if resp and resp.get("data"):
                 oid = str(resp["data"].get("nOrdNo") or resp["data"].get("orderId") or "")
-                log.info(f"✅ Order placed: {oid} | {transaction_type} {qty}×{trading_symbol}")
+                log.info(f"[OK] Order placed: {oid} | {transaction_type} {qty}×{trading_symbol}")
                 return oid
             raise RuntimeError(f"Order placement failed: {resp}")
         except Exception as e:
             log.error(f"Place order error: {e}")
             raise
 
-    # ── Place SL order ───────────────────────────────────────
+    # -- Place SL order ---------------------------------------
     def place_sl_order(
         self, trading_symbol: str, qty: int,
         trigger_price: float, price: float,
@@ -314,7 +322,7 @@ class KotakNeoBroker:
     ) -> str:
         if CFG["paper_trade"]:
             oid = f"PAPER_SL_{int(time.time())}"
-            log.info(f"[PAPER] SL {transaction_type} {qty}×{trading_symbol} trig={trigger_price:.1f} → {oid}")
+            log.info(f"[PAPER] SL {transaction_type} {qty}×{trading_symbol} trig={trigger_price:.1f} -> {oid}")
             return oid
         try:
             resp = self._client().place_order(
@@ -335,20 +343,20 @@ class KotakNeoBroker:
             )
             if resp and resp.get("data"):
                 oid = str(resp["data"].get("nOrdNo") or resp["data"].get("orderId") or "")
-                log.info(f"🛑 SL placed: {oid} @ trig={trigger_price:.1f}")
+                log.info(f"[SL] SL placed: {oid} @ trig={trigger_price:.1f}")
                 return oid
             raise RuntimeError(f"SL order failed: {resp}")
         except Exception as e:
             log.error(f"SL order error: {e}")
             raise
 
-    # ── Modify order ─────────────────────────────────────────
+    # -- Modify order -----------------------------------------
     def modify_order(
         self, order_id: str, trading_symbol: str, qty: int,
         new_trigger_price: float, new_price: float,
     ) -> str:
         if CFG["paper_trade"]:
-            log.info(f"[PAPER] MODIFY {order_id} → trig={new_trigger_price:.1f}")
+            log.info(f"[PAPER] MODIFY {order_id} -> trig={new_trigger_price:.1f}")
             return order_id
         try:
             resp = self._client().modify_order(
@@ -365,13 +373,13 @@ class KotakNeoBroker:
             )
             if resp and resp.get("data"):
                 new_oid = str(resp["data"].get("nOrdNo") or order_id)
-                log.info(f"✏️ Modified: {order_id} → trig={new_trigger_price:.1f}")
+                log.info(f"[MODIFY] Modified: {order_id} -> trig={new_trigger_price:.1f}")
                 return new_oid
         except Exception as e:
             log.error(f"Modify order error: {e}")
         return order_id
 
-    # ── Cancel order ─────────────────────────────────────────
+    # -- Cancel order -----------------------------------------
     def cancel_order(self, order_id: str) -> bool:
         if CFG["paper_trade"]:
             log.info(f"[PAPER] CANCEL {order_id}")
@@ -383,7 +391,7 @@ class KotakNeoBroker:
             log.error(f"Cancel error: {e}")
             return False
 
-    # ── Positions ────────────────────────────────────────────
+    # -- Positions --------------------------------------------
     def get_positions(self) -> list:
         try:
             resp = self._client().positions()
@@ -393,7 +401,7 @@ class KotakNeoBroker:
             log.error(f"Positions fetch failed: {e}")
         return []
 
-    # ── WebSocket feed ───────────────────────────────────────
+    # -- WebSocket feed ---------------------------------------
     def subscribe_ltp(self, tokens: list, on_tick_callback):
         try:
             c = self._client()
@@ -410,9 +418,9 @@ class KotakNeoBroker:
 broker = KotakNeoBroker()
 
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # TRADING STATE
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 @dataclass
 class OpenPosition:
     symbol:          str
@@ -445,7 +453,7 @@ class TradingState:
     def reset_if_new_day(self):
         today = date.today()
         if today != self.last_reset:
-            log.info("🗓 New trading day — resetting counters")
+            log.info("[DAY] New trading day -- resetting counters")
             self.daily_trades = 0
             self.daily_pnl    = 0.0
             self.halted       = False
@@ -456,13 +464,13 @@ class TradingState:
         if self.halted:
             return False, "Trading halted"
         if not self.session_ok:
-            return False, "Broker session not active — POST /login first"
+            return False, "Broker session not active -- POST /login first"
         if self.daily_trades >= CFG["max_trades"]:
             return False, f"Max daily trades reached ({CFG['max_trades']})"
         max_loss = CFG["max_capital"] * CFG["max_daily_loss"] / 100
         if self.daily_pnl <= -max_loss:
             self.halted = True
-            return False, f"Daily loss limit hit ₹{abs(self.daily_pnl):.0f}"
+            return False, f"Daily loss limit hit Rs.{abs(self.daily_pnl):.0f}"
         return True, "OK"
 
 
@@ -470,9 +478,9 @@ state      = TradingState()
 state_lock = threading.Lock()
 
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # OPTION SYMBOL BUILDER
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 def round_to_strike(price: float, index: str) -> int:
     step = STRIKE_STEPS.get(index, 50)
     return int(round(price / step) * step)
@@ -480,10 +488,10 @@ def round_to_strike(price: float, index: str) -> int:
 def get_next_expiry(index: str, expiry_type: str = "Weekly") -> str:
     """
     Returns expiry in Kotak Neo format: DDMMMYY (e.g. 26MAR25)
-    BANKNIFTY: Wednesday  |  Others: Thursday
+    BANKNIFTY: Wednesday  |  Others: Thursday (NSE standard)  |  Monthly: last Wed/Thu of month
     """
     today      = date.today()
-    exp_wday   = 2 if index == "BANKNIFTY" else 3   # Wed=2, Thu=3
+    exp_wday   = 2 if index == "BANKNIFTY" else 3   # Wed=2, TUE=3
 
     if expiry_type == "Monthly":
         month, year = today.month, today.year
@@ -526,14 +534,14 @@ def build_option_symbol(
     return symbol
 
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # CAPITAL-AWARE LOT CALCULATOR
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 def calculate_lots_for_capital(opt_ltp: float, lot_size: int) -> int:
     """
-    For ₹20,000 capital:
+    For Rs.20,000 capital:
       - Use ~80% of available capital for premium
-      - Don't buy more than 1 lot if premium × lot_size > ₹8,000
+      - Don't buy more than 1 lot if premium × lot_size > Rs.8,000
     """
     available = min(FundManager.get_available(), CFG["max_capital"])
     usable    = available * 0.80   # keep 20% buffer
@@ -547,14 +555,14 @@ def calculate_lots_for_capital(opt_ltp: float, lot_size: int) -> int:
     max_lots = max(1, int(available * 0.50 / cost_per_lot))
     lots     = min(lots, max_lots, 3)   # absolute max 3 lots
 
-    log.info(f"Lot calc: available=₹{available:.0f} usable=₹{usable:.0f} "
-             f"cost/lot=₹{cost_per_lot:.0f} → {lots} lot(s)")
+    log.info(f"Lot calc: available=Rs.{available:.0f} usable=Rs.{usable:.0f} "
+             f"cost/lot=Rs.{cost_per_lot:.0f} -> {lots} lot(s)")
     return lots
 
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # FUND MANAGER
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 class FundManager:
     @staticmethod
     def get_available() -> float:
@@ -569,20 +577,20 @@ class FundManager:
         cost = opt_ltp * lots * lot_size
         avail = FundManager.get_available()
         if cost > avail * 0.90:   # keep 10% buffer
-            return False, f"Insufficient funds: need ₹{cost:.0f}, have ₹{avail:.0f}"
-        return True, f"Funds OK: cost ₹{cost:.0f} of ₹{avail:.0f} available"
+            return False, f"Insufficient funds: need Rs.{cost:.0f}, have Rs.{avail:.0f}"
+        return True, f"Funds OK: cost Rs.{cost:.0f} of Rs.{avail:.0f} available"
 
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # TRAILING SL MONITOR
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 class TrailMonitor(threading.Thread):
     def __init__(self, check_interval: int = 5):
         super().__init__(daemon=True, name="TrailMonitor")
         self.check_interval = check_interval
 
     def run(self):
-        log.info(f"🔁 Trail monitor started (interval={self.check_interval}s)")
+        log.info(f"[LOOP] Trail monitor started (interval={self.check_interval}s)")
         while True:
             try:
                 self._tick()
@@ -608,13 +616,13 @@ class TrailMonitor(threading.Thread):
 
         # Target hit
         if ltp >= pos.target_opt:
-            log.info(f"🎯 TARGET HIT: {symbol} @ ₹{ltp:.1f} (target={pos.target_opt:.1f})")
+            log.info(f"[TARGET] TARGET HIT: {symbol} @ Rs.{ltp:.1f} (target={pos.target_opt:.1f})")
             self._exit(pos, symbol, ltp, "TGT_HIT")
             return
 
         # SL hit
         if (is_ce and ltp <= pos.trail_sl_opt) or (not is_ce and ltp <= pos.trail_sl_opt):
-            log.info(f"🛑 SL HIT: {symbol} @ ₹{ltp:.1f} (sl={pos.trail_sl_opt:.1f})")
+            log.info(f"[SL] SL HIT: {symbol} @ Rs.{ltp:.1f} (sl={pos.trail_sl_opt:.1f})")
             self._exit(pos, symbol, ltp, "SL_HIT")
             return
 
@@ -624,7 +632,7 @@ class TrailMonitor(threading.Thread):
             if candidate > pos.trail_sl_opt:
                 old = pos.trail_sl_opt
                 pos.trail_sl_opt = candidate
-                log.info(f"📈 Trail SL: {symbol} ₹{old:.1f} → ₹{candidate:.1f}")
+                log.info(f"[TRAIL] Trail SL: {symbol} Rs.{old:.1f} -> Rs.{candidate:.1f}")
                 if pos.sl_oid:
                     new_oid = broker.modify_order(
                         order_id=pos.sl_oid,
@@ -650,21 +658,21 @@ class TrailMonitor(threading.Thread):
             pos.status = reason
             pos.pnl    = pnl
             state.daily_pnl += pnl
-        emoji = "✅" if pnl >= 0 else "❌"
-        log.info(f"{emoji} {reason} | {symbol} | entry={pos.entry_price:.1f} exit={exit_ltp:.1f} | P&L ₹{pnl:.0f}")
+        emoji = "[OK]" if pnl >= 0 else "[LOSS]"
+        log.info(f"{emoji} {reason} | {symbol} | entry={pos.entry_price:.1f} exit={exit_ltp:.1f} | P&L Rs.{pnl:.0f}")
 
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # TRADE EXECUTOR
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 def execute_trade(payload: dict) -> dict:
-    # ── Handle square-off action ──────────────────────────
+    # -- Handle square-off action --------------------------
     if payload.get("action") in ("SQUAREOFF_ALL", "EXIT_ALL"):
         return _squareoff_all_internal()
 
     action     = payload.get("action", "")
-    index      = payload.get("index", "BANKNIFTY").upper()
-    strike_m   = payload.get("strike", "ATM")
+    index      = payload.get("index", "NIFTY").upper()
+    strike_m   = payload.get("strike", "OTM2").upper()
     expiry     = payload.get("expiry", "Weekly")
     trail_mode = payload.get("trail", "ATR")
 
@@ -678,7 +686,7 @@ def execute_trade(payload: dict) -> dict:
 
     lot_size = LOT_SIZES.get(index, 30)   # FIX: use correct lot sizes
 
-    # ── Pre-trade checks ──────────────────────────────────
+    # -- Pre-trade checks ----------------------------------
     ok, reason = state.can_trade()
     if not ok:
         return {"status": "REJECTED", "reason": reason}
@@ -690,44 +698,44 @@ def execute_trade(payload: dict) -> dict:
     sl_price  = float(payload.get("sl", 0))
     tgt_price = float(payload.get("target", 0))
 
-    # ── Build option symbol ───────────────────────────────
+    # -- Build option symbol -------------------------------
     symbol = build_option_symbol(index, strike_m, expiry, option, underlying_ltp)
 
-    # ── Get option LTP ────────────────────────────────────
+    # -- Get option LTP ------------------------------------
     opt_ltp = broker.get_ltp(symbol)
     if opt_ltp <= 0:
         if CFG["paper_trade"]:
             opt_ltp = 200.0   # paper trade fallback
-            log.info(f"[PAPER] Using synthetic option LTP: ₹{opt_ltp}")
+            log.info(f"[PAPER] Using synthetic option LTP: Rs.{opt_ltp}")
         else:
             return {"status": "ERROR", "reason": f"LTP=0 for {symbol}. Check symbol/market hours."}
 
-    # ── Premium cap (protect 20k capital) ────────────────
+    # -- Premium cap (protect 20k capital) ----------------
     if opt_ltp > CFG["max_premium"] and not CFG["paper_trade"]:
-        log.warning(f"Premium ₹{opt_ltp:.0f} > cap ₹{CFG['max_premium']:.0f} — trying OTM1")
+        log.warning(f"Premium Rs.{opt_ltp:.0f} > cap Rs.{CFG['max_premium']:.0f} -- trying OTM1")
         symbol  = build_option_symbol(index, "OTM1", expiry, option, underlying_ltp)
         opt_ltp = broker.get_ltp(symbol)
         if opt_ltp > CFG["max_premium"]:
             return {
                 "status": "REJECTED",
-                "reason": f"Premium ₹{opt_ltp:.0f} still exceeds cap ₹{CFG['max_premium']:.0f}. "
+                "reason": f"Premium Rs.{opt_ltp:.0f} still exceeds cap Rs.{CFG['max_premium']:.0f}. "
                           f"Increase MAX_PREMIUM or reduce capital usage."
             }
 
-    # ── Auto lot sizing based on capital ─────────────────
+    # -- Auto lot sizing based on capital -----------------
     # FIX: calculate lots from available capital, not from payload
     lots = calculate_lots_for_capital(opt_ltp, lot_size)
     qty  = lots * lot_size
 
-    # ── Fund check ────────────────────────────────────────
+    # -- Fund check ----------------------------------------
     ok, msg = FundManager.can_afford(opt_ltp, lots, lot_size)
     if not ok:
         return {"status": "REJECTED", "reason": msg}
 
     log.info(f"Fund check: {msg}")
 
-    # ── Option SL / target (in option premium terms) ──────
-    # Underlying move → option premium amplified ~3x (delta approx for ATM)
+    # -- Option SL / target (in option premium terms) ------
+    # Underlying move -> option premium amplified ~3x (delta approx for ATM)
     if sl_price > 0:
         underlying_move_pct = abs(underlying_ltp - sl_price) / underlying_ltp
     else:
@@ -736,7 +744,7 @@ def execute_trade(payload: dict) -> dict:
     sl_opt  = max(5.0, round(opt_ltp * (1 - underlying_move_pct * 3), 1))
     tgt_opt = round(opt_ltp * (1 + underlying_move_pct * 3 * 2), 1)   # 2:1 RR
 
-    # ── Place entry order ─────────────────────────────────
+    # -- Place entry order ---------------------------------
     try:
         entry_oid = broker.place_order(
             trading_symbol=symbol,
@@ -747,7 +755,7 @@ def execute_trade(payload: dict) -> dict:
     except Exception as e:
         return {"status": "ERROR", "reason": f"Entry order failed: {e}"}
 
-    # ── Place SL order ────────────────────────────────────
+    # -- Place SL order ------------------------------------
     sl_oid = ""
     try:
         sl_oid = broker.place_sl_order(
@@ -760,7 +768,7 @@ def execute_trade(payload: dict) -> dict:
     except Exception as e:
         log.warning(f"SL order failed (will monitor manually): {e}")
 
-    # ── Track position ────────────────────────────────────
+    # -- Track position ------------------------------------
     pos = OpenPosition(
         symbol=symbol, option=option, index=index,
         entry_price=opt_ltp,
@@ -793,8 +801,8 @@ def execute_trade(payload: dict) -> dict:
 
     cost = round(opt_ltp * qty, 2)
     log.info(
-        f"🚀 TRADE EXECUTED: {symbol} | {qty} qty ({lots}L) @ ₹{opt_ltp:.1f} | "
-        f"Cost ₹{cost:.0f} | SL ₹{sl_opt:.1f} | Tgt ₹{tgt_opt:.1f}"
+        f"[TRADE] TRADE EXECUTED: {symbol} | {qty} qty ({lots}L) @ Rs.{opt_ltp:.1f} | "
+        f"Cost Rs.{cost:.0f} | SL Rs.{sl_opt:.1f} | Tgt Rs.{tgt_opt:.1f}"
     )
 
     return {
@@ -814,7 +822,7 @@ def execute_trade(payload: dict) -> dict:
 
 
 def _squareoff_all_internal() -> dict:
-    """Square off all open positions — used by /squareoff_all and SQUAREOFF_ALL action."""
+    """Square off all open positions -- used by /squareoff_all and SQUAREOFF_ALL action."""
     results = []
     with state_lock:
         symbols = [s for s, p in state.open_positions.items() if p.status == "OPEN"]
@@ -834,9 +842,9 @@ def _squareoff_all_internal() -> dict:
     return {"squared_off": results}
 
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # FLASK ROUTES
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -851,13 +859,13 @@ def login():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Receive signal JSON from kotak_live.py or TradingView → execute trade."""
+    """Receive signal JSON from kotak_live.py or TradingView -> execute trade."""
     try:
         payload = request.get_json(force=True)
-        log.info(f"📩 Webhook received: {payload}")
+        log.info(f"[WEBHOOK] Webhook received: {payload}")
 
         if payload.get("tag") != CFG["webhook_secret"]:
-            return jsonify({"error": "Unauthorized — wrong webhook_secret"}), 403
+            return jsonify({"error": "Unauthorized -- wrong webhook_secret"}), 403
 
         result = execute_trade(payload)
         status_code = 200 if result.get("status") in ("EXECUTED", "PAPER", "OK") else 400
@@ -881,7 +889,7 @@ def status():
             "daily_trades":    state.daily_trades,
             "max_trades":      CFG["max_trades"],
             "daily_pnl":       round(state.daily_pnl, 2),
-            "max_daily_loss":  f"₹{CFG['max_capital'] * CFG['max_daily_loss'] / 100:.0f}",
+            "max_daily_loss":  f"Rs.{CFG['max_capital'] * CFG['max_daily_loss'] / 100:.0f}",
             "available_funds": FundManager.get_available(),
             "open_positions":  len(open_pos),
             "halted":          state.halted,
@@ -947,7 +955,7 @@ def squareoff_all():
 def halt():
     with state_lock:
         state.halted = True
-    log.warning("🚫 TRADING HALTED")
+    log.warning("[HALT] TRADING HALTED")
     return jsonify({"halted": True})
 
 
@@ -955,7 +963,7 @@ def halt():
 def resume():
     with state_lock:
         state.halted = False
-    log.info("✅ Trading RESUMED")
+    log.info("[OK] Trading RESUMED")
     return jsonify({"halted": False})
 
 
@@ -987,18 +995,18 @@ def health():
                     "session_ok": state.session_ok, "paper_trade": CFG["paper_trade"]})
 
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # STARTUP
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 if __name__ == "__main__":
     log.info("=" * 65)
-    log.info("🇮🇳  Kotak Neo Options Auto-Trader v4.0 (FIXED)")
+    log.info("  [IN] Kotak Neo Options Auto-Trader v4.0 (FIXED)")
     log.info(f"    Environment : {CFG['environment'].upper()}")
     log.info(f"    Paper Mode  : {CFG['paper_trade']}")
-    log.info(f"    Capital     : ₹{CFG['max_capital']:,.0f}")
-    log.info(f"    Max Loss/Day: {CFG['max_daily_loss']}%  = ₹{CFG['max_capital'] * CFG['max_daily_loss'] / 100:,.0f}")
+    log.info(f"    Capital     : Rs.{CFG['max_capital']:,.0f}")
+    log.info(f"    Max Loss/Day: {CFG['max_daily_loss']}%  = Rs.{CFG['max_capital'] * CFG['max_daily_loss'] / 100:,.0f}")
     log.info(f"    Max Trades  : {CFG['max_trades']} per day")
-    log.info(f"    Max Premium : ₹{CFG['max_premium']:.0f} per option")
+    log.info(f"    Max Premium : Rs.{CFG['max_premium']:.0f} per option")
     log.info(f"    Port        : {CFG['port']}")
     log.info("=" * 65)
 
@@ -1006,12 +1014,12 @@ if __name__ == "__main__":
         try:
             neo_client.login()
             # session_ok is set inside login() now
-            log.info("✅ Auto-login successful — session_ok=True")
+            log.info("[OK] Auto-login successful -- session_ok=True")
         except Exception as e:
-            log.warning(f"Auto-login failed: {e}")
-            log.warning("⚠️  POST /login to authenticate manually")
+            log.warning(f"[WARN] Auto-login failed: {e}")
+            log.warning("[WARN] POST /login to authenticate manually")
     else:
-        log.warning("⚠️  Credentials not configured — set .env")
+        log.warning("[WARN] Credentials not configured -- set .env")
 
     TrailMonitor(check_interval=5).start()
     app.run(host="0.0.0.0", port=CFG["port"], debug=False)

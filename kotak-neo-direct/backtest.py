@@ -25,6 +25,7 @@ Install:
 
 import os, sys, json, argparse, time, logging
 import warnings
+
 warnings.filterwarnings('ignore')
 from datetime import datetime, date, timedelta
 from dataclasses import dataclass, field, asdict
@@ -197,7 +198,7 @@ def _generate_synthetic_data(index: str, tf_min: int, days: int) -> pd.DataFrame
 # ═════════════════════════════════════════════════════════════
 class Backtester:
     def __init__(self, df: pd.DataFrame, cfg: EngineConfig,
-                 index: str = "BANKNIFTY",
+                 index: str = "NIFTY",
                  max_trades_per_day: int = 3,
                  initial_capital: float = 100000.0):
         self.df          = df
@@ -612,7 +613,7 @@ def generate_html_report(trades: List[Trade], metrics: dict,
   ADX: {cfg.adx_thresh} &nbsp;|&nbsp;
   Vol: {cfg.vol_mult}× &nbsp;|&nbsp;
   SL: ATR {cfg.sl_atr_mult}× &nbsp;|&nbsp;
-  Trail: {'GREEDY' if not getattr(cfg,'use_hard_target',False) else 'FIXED'} — Breakeven@{cfg.breakeven_atr}×ATR | Normal@{cfg.trail_atr_mult}×ATR | Tight@{cfg.greedy_trail}×ATR (after {cfg.greedy_atr}×ATR profit) &nbsp;|&nbsp;
+  Trail: {'GREEDY' if not getattr(cfg,'use_hard_target',False) else 'FIXED'} — Breakeven@{cfg.sl_pct}×ATR | Normal@{cfg.trail_step}×ATR | Tight@{cfg.trail_trig}×ATR (after {cfg.use_trail}×ATR profit) &nbsp;|&nbsp;
   Capital: Rs.{cfg.capital:,.0f} | Risk: {cfg.risk_pct}%
 </div>
 
@@ -722,10 +723,10 @@ def optimize(df: pd.DataFrame, index: str, capital: float):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtest signal engine on Kotak Neo data")
     parser.add_argument("--csv",      type=str,   default="",            help="Path to OHLCV CSV file")
-    parser.add_argument("--index",    type=str,   default="BANKNIFTY",   help="Index name")
+    parser.add_argument("--index",    type=str,   default="NIFTY",   help="Index name")
     parser.add_argument("--tf",       type=int,   default=5,             help="Timeframe in minutes")
     parser.add_argument("--days",     type=int,   default=30,            help="Historical days to fetch")
-    parser.add_argument("--capital",  type=float, default=20000,        help="Starting capital")
+    parser.add_argument("--capital",  type=float, default=100000.0,      help="Starting capital")
     parser.add_argument("--max-tpd",  type=int,   default=3,             help="Max trades per day")
     parser.add_argument("--optimize", action="store_true",               help="Run parameter optimization")
     parser.add_argument("--output",   type=str,   default="backtest_report.html", help="HTML report path")
@@ -747,16 +748,21 @@ if __name__ == "__main__":
     cfg = EngineConfig(
         capital          = args.capital,
         lot_size         = LOT_SIZES.get(args.index, 30),
-        # Greedy trail defaults — override via signal_engine.py EngineConfig
-        use_hard_target  = False,    # greedy mode: no fixed exit
-        breakeven_atr    = 0.8,
-        trail_atr_mult   = 1.0,
-        greedy_atr       = 2.0,
-        greedy_trail     = 0.5,
+        # breakeven_atr    = 0.8,
         sl_atr_mult      = 1.2,
-        tgt_rr           = 2.0,
         use_trail        = True,
     )
+
+#     cfg = EngineConfig(
+#     lot_size       = LOT_SIZES.get(args.index, 15),
+#     capital        = args.capital,
+#     min_confirmations       = 5,        # FIXED: was 8/8, now 5/8
+#     # cross_lookback = 1,        # EMA cross valid for 3 bars
+#     vol_required     = False,    # FIXED: disable unreliable index volume
+#     adx_thresh     = 20,       # FIXED: was 25
+#     max_lots       = 3,
+#     risk_pct       = 5.0,
+# )
 
     # ── Optimize or run single backtest ──
     if args.optimize:
