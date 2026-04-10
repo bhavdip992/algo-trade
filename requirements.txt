@@ -1,0 +1,8 @@
+pandas
+numpy
+python-dotenv
+pyotp
+flask
+requests
+
+neo_api_client
