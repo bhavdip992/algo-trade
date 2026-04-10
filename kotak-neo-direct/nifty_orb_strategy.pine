@@ -1,0 +1,212 @@
+// ============================================================
+// Nifty ORB + VWAP + EMA Strategy  v3.0 — Full Display
+// Matches signal_engine.py logic exactly
+// Shows: Entry, SL line, Target line, full signal data label
+// Timeframe: 5-min | Index: Nifty 50
+// ============================================================
+//@version=5
+indicator("Nifty ORB+VWAP+EMA v3.0 — Full", overlay=true, max_boxes_count=100, max_labels_count=200, max_lines_count=200)
+
+// ─── INPUTS ──────────────────────────────────────────────────
+fast_len   = input.int(9,    "EMA Fast",      group="EMA")
+mid_len    = input.int(21,   "EMA Mid",       group="EMA")
+slow_len   = input.int(50,   "EMA Slow",      group="EMA")
+orb_bars   = input.int(3,    "ORB Bars (3=9:15-9:30)", group="ORB", minval=1, maxval=10)
+show_orb   = input.bool(true,"Show ORB Box",  group="ORB")
+rsi_len    = input.int(14,   "RSI Length",    group="RSI")
+rsi_ob     = input.int(65,   "RSI OB",        group="RSI")
+rsi_os     = input.int(32,   "RSI OS",        group="RSI")
+adx_len    = input.int(14,   "ADX Length",    group="ADX")
+adx_min    = input.int(22,   "ADX Min",       group="ADX")
+st_atr_l   = input.int(10,   "ST ATR Len",    group="Supertrend")
+st_factor  = input.float(2.5,"ST Factor",     group="Supertrend")
+bb_len     = input.int(20,   "BB Length",     group="BB")
+bb_std     = input.float(2.0,"BB StdDev",     group="BB")
+atr_len    = input.int(14,   "ATR Length",    group="ATR")
+// SL/Target multipliers — must match signal_engine.py EngineConfig
+sl_mult    = input.float(1.2,"SL ATR Mult",   group="SL/Target", step=0.1)
+tgt_mult   = input.float(2.5,"Target ATR Mult",group="SL/Target",step=0.1)
+show_ema   = input.bool(true, "Show EMAs",    group="Display")
+show_vwap  = input.bool(true, "Show VWAP",   group="Display")
+cooldown   = input.int(3,     "Cooldown bars",group="Display", minval=0)
+
+// ─── TIME FILTER ─────────────────────────────────────────────
+in_session = not na(time(timeframe.period, "0930-1445", "Asia/Kolkata"))
+
+// ─── EMAs ────────────────────────────────────────────────────
+ema_f = ta.ema(close, fast_len)
+ema_m = ta.ema(close, mid_len)
+ema_s = ta.ema(close, slow_len)
+ema_bull = ema_f > ema_m and ema_m > ema_s
+ema_bear = ema_f < ema_m and ema_m < ema_s
+
+// ─── RSI ─────────────────────────────────────────────────────
+rsi_val  = ta.rsi(close, rsi_len)
+rsi_buy  = rsi_val > 45 and rsi_val < rsi_ob
+rsi_sell = rsi_val > rsi_os and rsi_val < 55
+
+// ─── ADX ─────────────────────────────────────────────────────
+[_dp, _dm, adx_val] = ta.dmi(adx_len, adx_len)
+trending = adx_val > adx_min
+
+// ─── Bollinger Bands Squeeze ─────────────────────────────────
+[bb_basis, bb_upper, bb_lower] = ta.bb(close, bb_len, bb_std)
+bw         = (bb_upper - bb_lower) / bb_basis
+bw_avg     = ta.sma(bw, bb_len)
+squeeze    = bw < bw_avg * 0.60
+no_squeeze = not squeeze
+
+// ─── Supertrend ──────────────────────────────────────────────
+[st_line, st_dir] = ta.supertrend(st_factor, st_atr_l)
+st_bull = st_dir < 0
+st_bear = st_dir > 0
+
+// ─── VWAP ────────────────────────────────────────────────────
+vwap_val  = ta.vwap(hlc3)
+vwap_bull = close > vwap_val
+vwap_bear = close < vwap_val
+
+// ─── ATR + Candle Body ───────────────────────────────────────
+atr_val     = ta.atr(atr_len)
+candle_body = math.abs(close - open)
+body_ok     = candle_body >= atr_val * 0.25
+
+// ─── OPENING RANGE BREAKOUT ──────────────────────────────────
+is_new_day = ta.change(time("D")) != 0
+
+var int   bar_of_day = 0
+var float orb_high   = na
+var float orb_low    = na
+var bool  orb_done   = false
+
+bar_of_day := is_new_day ? 1 : bar_of_day + 1
+
+if is_new_day
+    orb_high := na
+    orb_low  := na
+    orb_done := false
+
+if bar_of_day <= orb_bars
+    orb_high := na(orb_high) ? high : math.max(orb_high, high)
+    orb_low  := na(orb_low)  ? low  : math.min(orb_low, low)
+
+if bar_of_day == orb_bars
+    orb_done := true
+
+orb_formed = orb_done and not na(orb_high)
+orb_bull   = orb_formed and close > orb_high
+orb_bear   = orb_formed and close < orb_low
+
+// ─── MANDATORY GATE ──────────────────────────────────────────
+ce_mandatory = orb_bull and vwap_bull and ema_bull
+pe_mandatory = orb_bear and vwap_bear and ema_bear
+
+// ─── CONFIRMATIONS (≥2 of 4) ─────────────────────────────────
+ce_conf  = (rsi_buy ? 1 : 0) + (trending ? 1 : 0) + (st_bull ? 1 : 0) + (body_ok and no_squeeze ? 1 : 0)
+pe_conf  = (rsi_sell ? 1 : 0) + (trending ? 1 : 0) + (st_bear ? 1 : 0) + (body_ok and no_squeeze ? 1 : 0)
+min_conf = 2
+
+// ─── COOLDOWN ────────────────────────────────────────────────
+var int bars_since_signal = 99
+bars_since_signal := bars_since_signal + 1
+
+raw_ce  = ce_mandatory and ce_conf >= min_conf and in_session
+raw_pe  = pe_mandatory and pe_conf >= min_conf and in_session
+buy_ok  = raw_ce and (not raw_pe or ce_conf >= pe_conf)
+sell_ok = raw_pe and (not raw_ce or pe_conf > ce_conf)
+
+signal_ce = buy_ok  and bars_since_signal >= cooldown
+signal_pe = sell_ok and bars_since_signal >= cooldown
+
+if signal_ce or signal_pe
+    bars_since_signal := 0
+
+// ─── SL / TARGET CALCULATION (matches signal_engine.py ATR mode) ─
+// CE: SL = close - ATR*sl_mult  |  Target = close + ATR*tgt_mult
+// PE: SL = close + ATR*sl_mult  |  Target = close - ATR*tgt_mult
+entry_price = close
+ce_sl  = entry_price - atr_val * sl_mult
+ce_tgt = entry_price + atr_val * tgt_mult
+pe_sl  = entry_price + atr_val * sl_mult
+pe_tgt = entry_price - atr_val * tgt_mult
+rr     = tgt_mult / sl_mult  // = 2.08
+
+// ─── PLOTS ───────────────────────────────────────────────────
+plot(show_ema ? ema_f : na, "EMA 9",  color=color.new(color.yellow, 0),   linewidth=1)
+plot(show_ema ? ema_m : na, "EMA 21", color=color.new(color.orange, 0),   linewidth=1)
+plot(show_ema ? ema_s : na, "EMA 50", color=color.new(color.red,    0),   linewidth=2)
+plot(show_vwap ? vwap_val : na, "VWAP", color=color.new(color.aqua, 0),   linewidth=2, style=plot.style_circles)
+plot(st_bull ? st_line : na, "ST Bull", color=color.new(color.lime, 20),  linewidth=2, style=plot.style_linebr)
+plot(st_bear ? st_line : na, "ST Bear", color=color.new(color.red,  20),  linewidth=2, style=plot.style_linebr)
+
+// ─── ORB BOX ─────────────────────────────────────────────────
+var box orb_box = na
+if is_new_day
+    box.delete(orb_box)
+if bar_of_day == orb_bars and show_orb
+    orb_box := box.new(left=bar_index - (orb_bars - 1), top=orb_high, right=bar_index + 60, bottom=orb_low, border_color=color.new(color.purple, 10), border_width=2, bgcolor=color.new(color.purple, 88))
+if orb_done and not na(orb_box)
+    box.set_right(orb_box, bar_index + 10)
+
+// ─── SL / TARGET LINES ───────────────────────────────────────
+var line sl_line    = na
+var line tgt_line   = na
+var line entry_line = na
+
+if signal_ce
+    line.delete(sl_line)
+    line.delete(tgt_line)
+    line.delete(entry_line)
+    entry_line := line.new(bar_index, close, bar_index + 30, close, color=color.new(color.white, 20), width=1, style=line.style_dashed)
+    sl_line    := line.new(bar_index, ce_sl,  bar_index + 30, ce_sl,  color=color.new(color.red,  0),  width=2, style=line.style_solid)
+    tgt_line   := line.new(bar_index, ce_tgt, bar_index + 30, ce_tgt, color=color.new(color.lime, 0),  width=2, style=line.style_solid)
+
+if signal_pe
+    line.delete(sl_line)
+    line.delete(tgt_line)
+    line.delete(entry_line)
+    entry_line := line.new(bar_index, close, bar_index + 30, close, color=color.new(color.white, 20), width=1, style=line.style_dashed)
+    sl_line    := line.new(bar_index, pe_sl,  bar_index + 30, pe_sl,  color=color.new(color.red,  0),  width=2, style=line.style_solid)
+    tgt_line   := line.new(bar_index, pe_tgt, bar_index + 30, pe_tgt, color=color.new(color.lime, 0),  width=2, style=line.style_solid)
+
+// ─── SIGNAL LABELS WITH FULL DATA ────────────────────────────
+if signal_ce
+    lbl_txt = "BUY CE  |  Conf:" + str.tostring(ce_conf) + "/4\n" + "─────────────────\n" + "Entry : " + str.tostring(close, "#.##") + "\n" + "Target: " + str.tostring(math.round(ce_tgt, 2), "#.##") + " (+" + str.tostring(math.round((ce_tgt - close) / close * 100, 2)) + "%)\n" + "SL    : " + str.tostring(math.round(ce_sl, 2), "#.##") + " (-" + str.tostring(math.round((close - ce_sl) / close * 100, 2)) + "%)\n" + "R:R   : 1:" + str.tostring(math.round(rr, 2)) + "\n" + "─────────────────\n" + "ATR   : " + str.tostring(math.round(atr_val, 1)) + "\n" + "RSI   : " + str.tostring(math.round(rsi_val, 1)) + " " + (rsi_buy ? "[OK]" : "[--]") + "\n" + "ADX   : " + str.tostring(math.round(adx_val, 1)) + " " + (trending ? "[OK]" : "[--]") + "\n" + "ST    : " + (st_bull ? "Bull [OK]" : "[--]") + "\n" + "Body  : " + (body_ok ? str.tostring(math.round(candle_body/atr_val*100, 0)) + "% [OK]" : "[thin]") + "\n" + "─────────────────\n" + "ORB H : " + str.tostring(math.round(orb_high, 0)) + "\n" + "VWAP  : " + str.tostring(math.round(vwap_val, 1))
+    label.new(bar_index, low - atr_val * 1.5, text=lbl_txt, color=color.new(color.green, 5), textcolor=color.white, style=label.style_label_up, size=size.small)
+    alert("BUY CE | Entry=" + str.tostring(close, "#.##") + " | SL=" + str.tostring(math.round(ce_sl,2)) + " | Tgt=" + str.tostring(math.round(ce_tgt,2)) + " | RSI=" + str.tostring(math.round(rsi_val,1)) + " | ADX=" + str.tostring(math.round(adx_val,1)), alert.freq_once_per_bar_close)
+
+if signal_pe
+    lbl_txt = "BUY PE  |  Conf:" + str.tostring(pe_conf) + "/4\n" + "─────────────────\n" + "Entry : " + str.tostring(close, "#.##") + "\n" + "Target: " + str.tostring(math.round(pe_tgt, 2), "#.##") + " (-" + str.tostring(math.round((close - pe_tgt) / close * 100, 2)) + "%)\n" + "SL    : " + str.tostring(math.round(pe_sl, 2), "#.##") + " (+" + str.tostring(math.round((pe_sl - close) / close * 100, 2)) + "%)\n" + "R:R   : 1:" + str.tostring(math.round(rr, 2)) + "\n" + "─────────────────\n" + "ATR   : " + str.tostring(math.round(atr_val, 1)) + "\n" + "RSI   : " + str.tostring(math.round(rsi_val, 1)) + " " + (rsi_sell ? "[OK]" : "[--]") + "\n" + "ADX   : " + str.tostring(math.round(adx_val, 1)) + " " + (trending ? "[OK]" : "[--]") + "\n" + "ST    : " + (st_bear ? "Bear [OK]" : "[--]") + "\n" + "Body  : " + (body_ok ? str.tostring(math.round(candle_body/atr_val*100, 0)) + "% [OK]" : "[thin]") + "\n" + "─────────────────\n" + "ORB L : " + str.tostring(math.round(orb_low, 0)) + "\n" + "VWAP  : " + str.tostring(math.round(vwap_val, 1))
+    label.new(bar_index, high + atr_val * 1.5, text=lbl_txt, color=color.new(color.red, 5), textcolor=color.white, style=label.style_label_down, size=size.small)
+    alert("BUY PE | Entry=" + str.tostring(close, "#.##") + " | SL=" + str.tostring(math.round(pe_sl,2)) + " | Tgt=" + str.tostring(math.round(pe_tgt,2)) + " | RSI=" + str.tostring(math.round(rsi_val,1)) + " | ADX=" + str.tostring(math.round(adx_val,1)), alert.freq_once_per_bar_close)
+
+// ─── LIVE STATUS TABLE ───────────────────────────────────────
+var table tbl = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 55), border_color=color.new(color.gray, 40), border_width=1, frame_width=1)
+
+if barstate.islast
+    cB = color.new(color.lime,  15)
+    cR = color.new(color.red,   15)
+    cN = color.new(color.gray,  50)
+    cO = color.new(color.orange,15)
+    cW = color.white
+
+    table.cell(tbl, 0, 0, "Nifty ORB v3.0",     text_color=color.yellow,  text_size=size.small, bgcolor=color.new(color.navy,20))
+    table.cell(tbl, 1, 0, in_session ? "IN SESSION" : "OUT", text_color=cW, text_size=size.small, bgcolor=in_session ? cB : cN)
+    table.cell(tbl, 0, 1, "ORB " + str.tostring(math.round(orb_low,0)) + "-" + str.tostring(math.round(orb_high,0)), text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 1, orb_formed ? (orb_bull ? "BULL BREAK" : orb_bear ? "BEAR BREAK" : "Inside") : "Forming", bgcolor=orb_bull ? cB : orb_bear ? cR : cN, text_color=cW, text_size=size.small)
+    table.cell(tbl, 0, 2, "VWAP " + str.tostring(math.round(vwap_val,1)), text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 2, vwap_bull ? "Price Above" : "Price Below", bgcolor=vwap_bull ? cB : cR, text_color=cW, text_size=size.small)
+    table.cell(tbl, 0, 3, "EMA 9/21/50", text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 3, ema_bull ? "BULL Stack" : ema_bear ? "BEAR Stack" : "Mixed",    bgcolor=ema_bull ? cB : ema_bear ? cR : cN, text_color=cW, text_size=size.small)
+    table.cell(tbl, 0, 4, "RSI  " + str.tostring(math.round(rsi_val,1)), text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 4, rsi_buy ? "Buy zone" : rsi_sell ? "Sell zone" : "Neutral",      bgcolor=rsi_buy ? cB : rsi_sell ? cR : cN, text_color=cW, text_size=size.small)
+    table.cell(tbl, 0, 5, "ADX  " + str.tostring(math.round(adx_val,1)), text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 5, trending ? "Trending" : "Ranging",                               bgcolor=trending ? cB : cN, text_color=cW, text_size=size.small)
+    table.cell(tbl, 0, 6, "ST",          text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 6, st_bull ? "Bullish" : "Bearish",                                 bgcolor=st_bull ? cB : cR, text_color=cW, text_size=size.small)
+    table.cell(tbl, 0, 7, "Squeeze",     text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 7, squeeze ? "SQUEEZE" : "No Squeeze",                              bgcolor=squeeze ? cO : cB, text_color=cW, text_size=size.small)
+    table.cell(tbl, 0, 8, "ATR  " + str.tostring(math.round(atr_val,1)), text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 8, "SL=" + str.tostring(math.round(atr_val*sl_mult,1)) + " Tgt=" + str.tostring(math.round(atr_val*tgt_mult,1)), text_color=cW, text_size=size.small, bgcolor=cN)
+    table.cell(tbl, 0, 9, "Signal",      text_color=cW, text_size=size.small)
+    table.cell(tbl, 1, 9, signal_ce ? "BUY CE" : signal_pe ? "BUY PE" : "NONE",           bgcolor=signal_ce ? cB : signal_pe ? cR : cN, text_color=cW, text_size=size.normal)

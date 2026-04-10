@@ -1,0 +1,405 @@
+//@version=6
+// ============================================================
+// INDIA OPTIONS AUTO-TRADER — Pine Script v6
+// Compatible with: NSE/BSE | NIFTY, BANKNIFTY, FINNIFTY
+// Broker Bridge: Zerodha Kite / Fyers / Angel One via webhook
+// ============================================================
+indicator("🇮🇳 India Options Auto-Trader", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 1 — INPUTS
+// ─────────────────────────────────────────────────────────────
+
+// ── Index Selection ──
+index_name   = input.string("BANKNIFTY", "Index", options=["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
+lot_size     = input.int(15, "Lot Size (auto-set per index)", tooltip="NIFTY=50 | BANKNIFTY=15 | FINNIFTY=40")
+num_lots     = input.int(1, "Number of Lots", minval=1, maxval=50)
+
+// ── Option Parameters ──
+option_type  = input.string("AUTO", "Option Type", options=["AUTO", "CE Only", "PE Only"])
+strike_mode  = input.string("ATM", "Strike Selection", options=["ATM", "1 OTM", "2 OTM", "1 ITM"])
+expiry_type  = input.string("Weekly", "Expiry", options=["Weekly", "Monthly"])
+
+// ── Capital & Risk Management ──
+capital       = input.float(100000, "Available Capital (₹)", minval=10000)
+risk_per_trade= input.float(2.0,   "Risk % Per Trade", minval=0.5, maxval=10)
+max_daily_loss= input.float(5.0,   "Max Daily Loss %", minval=1,   maxval=20)
+max_trades_day= input.int(3,       "Max Trades Per Day", minval=1, maxval=10)
+
+// ── Strategy Inputs ──
+// EMA
+fast_len   = input.int(9,  "Fast EMA")
+mid_len    = input.int(21, "Mid EMA")
+slow_len   = input.int(50, "Slow EMA")
+trend_len  = input.int(200,"Trend EMA")
+
+// Supertrend
+st_atr_len  = input.int(10,   "Supertrend ATR Length")
+st_factor   = input.float(3.0,"Supertrend Factor")
+
+// RSI
+rsi_len     = input.int(14, "RSI Length")
+rsi_ob      = input.int(70, "RSI Overbought")
+rsi_os      = input.int(30, "RSI Oversold")
+
+// VWAP
+use_vwap    = input.bool(true, "Use VWAP Filter")
+
+// Volume
+vol_mult    = input.float(1.5, "Volume Spike Multiplier")
+
+// ADX
+adx_len     = input.int(14,  "ADX Length")
+adx_thresh  = input.int(25,  "ADX Trend Threshold")
+
+// ── SL / Target / Trailing ──
+sl_mode      = input.string("ATR",    "Stop Loss Mode",    options=["ATR", "Fixed %", "Swing"])
+sl_atr_mult  = input.float(1.5,       "SL ATR Multiplier")
+sl_pct       = input.float(0.8,       "Fixed SL %")
+tgt_mode     = input.string("2:1 RR", "Target Mode",      options=["2:1 RR", "3:1 RR", "Fixed %", "ATR"])
+tgt_pct      = input.float(1.5,       "Fixed Target %")
+tgt_atr_mult = input.float(3.0,       "Target ATR Mult")
+
+// Trailing SL
+use_trail    = input.bool(true,  "Enable Trailing SL")
+trail_mode   = input.string("ATR","Trail Mode", options=["ATR", "Fixed %", "Breakeven+"])
+trail_trigger= input.float(0.5,  "Trail Trigger (ATR mult or %)")
+trail_step   = input.float(0.3,  "Trail Step (ATR mult or %)")
+
+// ── Session Filter ──
+session_filter = input.bool(true, "Indian Market Session Only")
+morning_avoid  = input.bool(true, "Avoid 9:15–9:30 (Opening Noise)")
+eod_avoid      = input.bool(true, "Avoid 3:10–3:30 (EOD Expiry Risk)")
+avoid_monday   = input.bool(false,"Avoid Monday Open (Gap Risk)")
+
+// ── Webhook / Broker ──
+webhook_enabled = input.bool(false, "Enable Webhook Alerts (JSON)")
+broker_name     = input.string("Zerodha","Broker", options=["Zerodha","Fyers","Angel One","Upstox","Dhan"])
+api_tag         = input.string("MY_API_KEY_TAG", "API Tag (for webhook)")
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 2 — SESSION & TIME UTILITIES
+// ─────────────────────────────────────────────────────────────
+ist_session   = "0915-1530:1234567"
+is_market     = not session_filter or (time(timeframe.period, ist_session, "Asia/Kolkata") != 0)
+is_open_noise = morning_avoid  and (hour(time, "Asia/Kolkata") == 9 and minute(time, "Asia/Kolkata") < 30)
+is_eod        = eod_avoid      and (hour(time, "Asia/Kolkata") == 15 and minute(time, "Asia/Kolkata") >= 10)
+is_monday_gap = avoid_monday   and (dayofweek(time, "Asia/Kolkata") == dayofweek.monday and hour(time, "Asia/Kolkata") == 9 and minute(time, "Asia/Kolkata") < 45)
+trade_allowed = is_market and not is_open_noise and not is_eod and not is_monday_gap
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 3 — INDICATORS
+// ─────────────────────────────────────────────────────────────
+
+// ── EMAs ──
+ema_fast  = ta.ema(close, fast_len)
+ema_mid   = ta.ema(close, mid_len)
+ema_slow  = ta.ema(close, slow_len)
+ema_trend = ta.ema(close, trend_len)
+
+// ── ATR ──
+atr = ta.atr(14)
+
+// ── Supertrend ──
+[st_line, st_dir] = ta.supertrend(st_factor, st_atr_len)
+st_bull = st_dir == -1
+st_bear = st_dir ==  1
+
+// ── RSI ──
+rsi = ta.rsi(close, rsi_len)
+
+// ── VWAP ──
+vwap_val = ta.vwap(hlc3)
+
+// ── Volume ──
+vol_avg   = ta.sma(volume, 20)
+vol_spike = volume > vol_avg * vol_mult
+
+// ── ADX / DMI ──
+[di_plus, di_minus, adx_val] = ta.dmi(adx_len, adx_len)
+is_trending = adx_val > adx_thresh
+
+// ── Bollinger Bands (for squeeze detection) ──
+[bb_mid, bb_up, bb_lo] = ta.bb(close, 20, 2.0)
+bb_width    = (bb_up - bb_lo) / bb_mid
+bb_squeeze  = bb_width < ta.sma(bb_width, 20) * 0.8
+
+// ── Candlestick Patterns ──
+doji        = math.abs(close - open) <= (high - low) * 0.1
+bullish_eng = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bearish_eng = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+hammer      = (high - low) > 3 * math.abs(close - open) and (close - low) / (0.001 + high - low) > 0.6
+shooting_st = (high - low) > 3 * math.abs(close - open) and (high - close) / (0.001 + high - low) > 0.6
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 4 — SIGNAL LOGIC (Multi-Confirmation)
+// ─────────────────────────────────────────────────────────────
+
+// ── Trend Direction ──
+bull_trend = close > ema_trend and ema_fast > ema_slow
+bear_trend = close < ema_trend and ema_fast < ema_slow
+
+// ── VWAP Filter ──
+vwap_bull = not use_vwap or close > vwap_val
+vwap_bear = not use_vwap or close < vwap_val
+
+// ── EMA Crossover ──
+ema_cross_up   = ta.crossover(ema_fast, ema_mid)
+ema_cross_down = ta.crossunder(ema_fast, ema_mid)
+
+// ── RSI Filter ──
+rsi_buy_ok  = rsi > 50 and rsi < rsi_ob
+rsi_sell_ok = rsi < 50 and rsi > rsi_os
+
+// ── Combined BUY Signal (CE entry) ──
+raw_buy = (
+     ema_cross_up
+     and bull_trend
+     and st_bull
+     and vwap_bull
+     and rsi_buy_ok
+     and is_trending
+     and vol_spike
+     and trade_allowed
+     and (not bb_squeeze)
+)
+
+// ── Combined SELL Signal (PE entry) ──
+raw_sell = (
+     ema_cross_down
+     and bear_trend
+     and st_bear
+     and vwap_bear
+     and rsi_sell_ok
+     and is_trending
+     and vol_spike
+     and trade_allowed
+     and (not bb_squeeze)
+)
+
+// ── Option Type Filter ──
+buy_signal  = raw_buy  and option_type != "PE Only"
+sell_signal = raw_sell and option_type != "CE Only"
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 5 — SL / TARGET / TRAIL COMPUTATION
+// ─────────────────────────────────────────────────────────────
+swing_lo = ta.lowest(low,  10)
+swing_hi = ta.highest(high, 10)
+
+// SL calculation
+float sl_buy = 0.0
+if sl_mode == "ATR"
+    sl_buy := close - atr * sl_atr_mult
+else if sl_mode == "Fixed %"
+    sl_buy := close * (1 - sl_pct / 100)
+else
+    sl_buy := swing_lo
+
+float sl_sell = 0.0
+if sl_mode == "ATR"
+    sl_sell := close + atr * sl_atr_mult
+else if sl_mode == "Fixed %"
+    sl_sell := close * (1 + sl_pct / 100)
+else
+    sl_sell := swing_hi
+
+// Risk in points
+risk_pts_buy  = close - sl_buy
+risk_pts_sell = sl_sell - close
+
+// Target calculation
+rr = tgt_mode == "2:1 RR" ? 2.0 : tgt_mode == "3:1 RR" ? 3.0 : 0.0
+
+float tgt_buy = 0.0
+if tgt_mode == "Fixed %"
+    tgt_buy := close * (1 + tgt_pct / 100)
+else if tgt_mode == "ATR"
+    tgt_buy := close + atr * tgt_atr_mult
+else
+    tgt_buy := close + risk_pts_buy * rr
+
+float tgt_sell = 0.0
+if tgt_mode == "Fixed %"
+    tgt_sell := close * (1 - tgt_pct / 100)
+else if tgt_mode == "ATR"
+    tgt_sell := close - atr * tgt_atr_mult
+else
+    tgt_sell := close - risk_pts_sell * rr
+
+// ── Position Sizing ──
+risk_amt   = capital * (risk_per_trade / 100)
+qty_lots   = math.min(num_lots, math.max(1, math.floor(risk_amt / (risk_pts_buy * lot_size))))
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 6 — TRAILING STOP LOGIC (on chart price)
+// ─────────────────────────────────────────────────────────────
+var float trail_sl_buy  = na
+var float trail_sl_sell = na
+var bool  in_long       = false
+var bool  in_short      = false
+var float entry_price   = na
+
+if buy_signal
+    in_long      := true
+    in_short     := false
+    entry_price  := close
+    trail_sl_buy := sl_buy
+
+if sell_signal
+    in_short      := true
+    in_long       := false
+    entry_price   := close
+    trail_sl_sell := sl_sell
+
+// Update trailing for longs
+if in_long and use_trail
+    trigger_price = entry_price + (trail_mode == "ATR" ? atr * trail_trigger : entry_price * trail_trigger / 100)
+    if close >= trigger_price
+        var float new_trail_l = 0.0
+        if trail_mode == "ATR"
+            new_trail_l := close - atr * trail_step
+        else if trail_mode == "Fixed %"
+            new_trail_l := close * (1 - trail_step / 100)
+        else
+            new_trail_l := entry_price
+        trail_sl_buy := math.max(trail_sl_buy, new_trail_l)
+    if close <= trail_sl_buy
+        in_long := false
+
+// Update trailing for shorts
+if in_short and use_trail
+    trigger_price = entry_price - (trail_mode == "ATR" ? atr * trail_trigger : entry_price * trail_trigger / 100)
+    if close <= trigger_price
+        var float new_trail_s = 0.0
+        if trail_mode == "ATR"
+            new_trail_s := close + atr * trail_step
+        else if trail_mode == "Fixed %"
+            new_trail_s := close * (1 + trail_step / 100)
+        else
+            new_trail_s := entry_price
+        trail_sl_sell := math.min(trail_sl_sell, new_trail_s)
+    if close >= trail_sl_sell
+        in_short := false
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 7 — DAILY P&L TRACKER
+// ─────────────────────────────────────────────────────────────
+var int   daily_trades = 0
+var float daily_pnl    = 0.0
+var int   last_day     = na
+is_new_day = dayofmonth != last_day
+if is_new_day
+    daily_trades := 0
+    daily_pnl    := 0.0
+    last_day     := dayofmonth
+
+daily_limit_hit = daily_trades >= max_trades_day or daily_pnl <= -(capital * max_daily_loss / 100)
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 8 — WEBHOOK JSON BUILDER
+// ─────────────────────────────────────────────────────────────
+strike_suffix_ce = strike_mode == "ATM" ? "ATM" : strike_mode == "1 OTM" ? "OTM1" : strike_mode == "2 OTM" ? "OTM2" : "ITM1"
+strike_suffix_pe = strike_suffix_ce
+
+webhook_buy = '{"broker":"' + broker_name + '","tag":"' + api_tag + '","action":"BUY_CE","index":"' + index_name + '","strike":"' + strike_suffix_ce + '","expiry":"' + expiry_type + '","lots":' + str.tostring(qty_lots) + ',"lot_size":' + str.tostring(lot_size) + ',"entry":' + str.tostring(close) + ',"sl":' + str.tostring(math.round(sl_buy, 2)) + ',"target":' + str.tostring(math.round(tgt_buy, 2)) + ',"trail":"' + (use_trail ? trail_mode : "OFF") + '"}'
+
+webhook_sell = '{"broker":"' + broker_name + '","tag":"' + api_tag + '","action":"BUY_PE","index":"' + index_name + '","strike":"' + strike_suffix_pe + '","expiry":"' + expiry_type + '","lots":' + str.tostring(qty_lots) + ',"lot_size":' + str.tostring(lot_size) + ',"entry":' + str.tostring(close) + ',"sl":' + str.tostring(math.round(sl_sell, 2)) + ',"target":' + str.tostring(math.round(tgt_sell, 2)) + ',"trail":"' + (use_trail ? trail_mode : "OFF") + '"}'
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 9 — PLOTS
+// ─────────────────────────────────────────────────────────────
+
+// EMAs
+plot(ema_fast,  "EMA 9",   color=color.new(color.aqua,   0), linewidth=1)
+plot(ema_mid,   "EMA 21",  color=color.new(color.yellow, 0), linewidth=1)
+plot(ema_slow,  "EMA 50",  color=color.new(color.orange, 0), linewidth=2)
+plot(ema_trend, "EMA 200", color=color.new(color.white,  30), linewidth=2)
+
+// VWAP
+plot(use_vwap ? vwap_val : na, "VWAP", color=color.new(color.fuchsia, 0), linewidth=2, style=plot.style_circles)
+
+// Supertrend
+plot(st_bull ? st_line : na, "ST Bull", color=color.new(color.lime,  0), linewidth=2, style=plot.style_linebr)
+plot(st_bear ? st_line : na, "ST Bear", color=color.new(color.red,   0), linewidth=2, style=plot.style_linebr)
+
+// SL / Target Lines
+plot(in_long  ? trail_sl_buy  : na, "Trail SL (Long)",  color=color.new(color.red,    0), linewidth=1, style=plot.style_linebr)
+plot(in_short ? trail_sl_sell : na, "Trail SL (Short)", color=color.new(color.green,  0), linewidth=1, style=plot.style_linebr)
+plot(buy_signal  ? tgt_buy    : na, "Target (Long)",    color=color.new(color.lime,   60), linewidth=1, style=plot.style_linebr)
+plot(sell_signal ? tgt_sell   : na, "Target (Short)",   color=color.new(color.orange, 60), linewidth=1, style=plot.style_linebr)
+
+// ── Buy / Sell Shapes ──
+plotshape(buy_signal  and not daily_limit_hit, "BUY CE",  location=location.belowbar, color=color.new(color.lime,  0), style=shape.labelup,   size=size.normal, text="CE📈")
+plotshape(sell_signal and not daily_limit_hit, "SELL PE", location=location.abovebar, color=color.new(color.red,   0), style=shape.labeldown, size=size.normal, text="PE📉")
+
+// Trailing exit markers
+trail_exit_long  = in_long[1]  and not in_long
+trail_exit_short = in_short[1] and not in_short
+plotshape(trail_exit_long,  "Trail Exit Long",  location=location.abovebar, color=color.new(color.yellow, 0), style=shape.xcross, size=size.small, text="TSL✂")
+plotshape(trail_exit_short, "Trail Exit Short", location=location.belowbar, color=color.new(color.yellow, 0), style=shape.xcross, size=size.small, text="TSL✂")
+
+// BB squeeze dots
+plotshape(bb_squeeze, "BB Squeeze", location=location.bottom, color=color.new(color.purple, 30), style=shape.circle, size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 10 — INFO TABLE (Top Right)
+// ─────────────────────────────────────────────────────────────
+var table info_tbl = table.new(position.top_right, 2, 12, border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(info_tbl, 0, 0,  "🇮🇳 OPTIONS TRADER",       text_color=color.white,   bgcolor=color.new(color.navy, 10), text_size=size.small)
+    table.cell(info_tbl, 1, 0,  index_name + " | " + expiry_type, text_color=color.yellow, bgcolor=color.new(color.navy, 10), text_size=size.small)
+    // Market
+    table.cell(info_tbl, 0, 1,  "Market",     text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 1,  trade_allowed ? "✅ OPEN" : "🚫 CLOSED", text_color=trade_allowed ? color.lime : color.red, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // Trend
+    table.cell(info_tbl, 0, 2,  "Trend",      text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 2,  bull_trend ? "📈 BULLISH" : bear_trend ? "📉 BEARISH" : "➡ SIDEWAYS", text_color=bull_trend ? color.lime : bear_trend ? color.red : color.yellow, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // ADX
+    table.cell(info_tbl, 0, 3,  "ADX",        text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 3,  str.tostring(math.round(adx_val, 1)) + (is_trending ? " ✅" : " ⚠"), text_color=is_trending ? color.lime : color.orange, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // RSI
+    table.cell(info_tbl, 0, 4,  "RSI",        text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 4,  str.tostring(math.round(rsi, 1)), text_color=rsi > rsi_ob ? color.red : rsi < rsi_os ? color.lime : color.white, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // ATR
+    table.cell(info_tbl, 0, 5,  "ATR",        text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 5,  str.tostring(math.round(atr, 1)), text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // SL
+    table.cell(info_tbl, 0, 6,  "Calc SL",    text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 6,  in_long ? str.tostring(math.round(trail_sl_buy, 1)) : in_short ? str.tostring(math.round(trail_sl_sell, 1)) : "—", text_color=color.red, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // Target
+    table.cell(info_tbl, 0, 7,  "Target",     text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 7,  in_long ? str.tostring(math.round(tgt_buy, 1)) : in_short ? str.tostring(math.round(tgt_sell, 1)) : "—", text_color=color.lime, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // Qty
+    table.cell(info_tbl, 0, 8,  "Lots / Qty", text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 8,  str.tostring(qty_lots) + " lots (" + str.tostring(qty_lots * lot_size) + " qty)", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // Risk
+    table.cell(info_tbl, 0, 9,  "Risk ₹",     text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 9,  "₹" + str.tostring(math.round(risk_amt, 0)), text_color=color.orange, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // Daily trades
+    table.cell(info_tbl, 0, 10, "Daily Trades",text_color=color.gray, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 10, str.tostring(daily_trades) + "/" + str.tostring(max_trades_day) + (daily_limit_hit ? " 🚫" : " ✅"), text_color=daily_limit_hit ? color.red : color.lime, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    // Broker
+    table.cell(info_tbl, 0, 11, "Broker",     text_color=color.gray,  bgcolor=color.new(color.black, 20), text_size=size.tiny)
+    table.cell(info_tbl, 1, 11, broker_name + (webhook_enabled ? " 🟢" : " 🔴"), text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 11 — ALERTS (Standard + Webhook JSON)
+// ─────────────────────────────────────────────────────────────
+buy_final  = buy_signal  and not daily_limit_hit
+sell_final = sell_signal and not daily_limit_hit
+
+alertcondition(buy_final,        "📈 CE Buy Signal",         "CE BUY | {{ticker}} | Entry: {{close}}")
+alertcondition(sell_final,       "📉 PE Buy Signal",         "PE BUY | {{ticker}} | Entry: {{close}}")
+alertcondition(trail_exit_long,  "✂ Trailing SL Exit (Long)", "TRAIL EXIT LONG | {{ticker}} | Price: {{close}}")
+alertcondition(trail_exit_short, "✂ Trailing SL Exit (Short)","TRAIL EXIT SHORT | {{ticker}} | Price: {{close}}")
+alertcondition(daily_limit_hit,  "🚫 Daily Limit Hit",        "DAILY LIMIT REACHED — Trading halted for today")
+
+// Webhook-formatted alerts (use these with TradingView webhook URL to broker bridge)
+if webhook_enabled
+    if buy_final
+        alert(webhook_buy,  alert.freq_once_per_bar_close)
+    if sell_final
+        alert(webhook_sell, alert.freq_once_per_bar_close)

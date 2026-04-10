@@ -1,0 +1,483 @@
+// ============================================================================
+//  KOTAK NEO — Options Signal Tracker  v5.0
+//  Pure TradingView indicator — no webhook, no external connection
+//
+//  WHAT THIS DOES:
+//    • Shows BUY CE / BUY PE signals on chart
+//    • Draws Entry, SL, Partial Target, Full Target lines
+//    • Trails SL automatically as price moves in your favour
+//    • Shows 50% partial exit point
+//    • Shows exit reason (SL HIT / TARGET / TRAIL SL / EOD)
+//    • Real-time confirmation table (8 checks) top-right corner
+//    • P&L points on every exit label
+//    • Score 0-10 on every entry label
+//
+//  SETUP:
+//    1. Add to BANKNIFTY or NIFTY spot chart
+//    2. Set timeframe to 5-min (or your preferred TF)
+//    3. All parameters match signal_engine.py defaults
+//
+//  8 CONFIRMATIONS:
+//    E = EMA Fast/Mid crossover
+//    T = Trend  (price vs EMA200, EMA fanning)
+//    S = Supertrend direction
+//    V = VWAP position
+//    R = RSI momentum + StochRSI
+//    A = ADX strength + DI direction
+//    L = Volume spike
+//    B = Bollinger Band expanding (no squeeze)
+// ============================================================================
+
+//@version=5
+indicator("Kotak Options Signal Tracker v5", shorttitle="KOTAK-SIG", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============================================================================
+// ─── INPUTS ─────────────────────────────────────────────────────────────────
+// ============================================================================
+
+// EMA
+i_ema_fast  = input.int(9,   "Fast EMA",    group="📈 EMA", minval=1)
+i_ema_mid   = input.int(21,  "Mid EMA",     group="📈 EMA", minval=1)
+i_ema_slow  = input.int(50,  "Slow EMA",    group="📈 EMA", minval=1)
+i_ema_trend = input.int(200, "Trend EMA",   group="📈 EMA", minval=1)
+
+// Supertrend
+i_st_atr    = input.int(10,    "ATR Length",  group="⚡ Supertrend", minval=1)
+i_st_mult   = input.float(3.0, "Factor",      group="⚡ Supertrend", step=0.1, minval=0.1)
+
+// RSI
+i_rsi_len   = input.int(14, "RSI Length",              group="📊 RSI", minval=1)
+i_rsi_ob    = input.int(68, "OB — block CE above this", group="📊 RSI", minval=50, maxval=100)
+i_rsi_os    = input.int(32, "OS — block PE below this", group="📊 RSI", minval=0,  maxval=50)
+
+// ADX
+i_adx_len   = input.int(14, "ADX Length",    group="📉 ADX", minval=1)
+i_adx_thr   = input.int(18, "Min ADX",       group="📉 ADX", minval=5, maxval=50)
+
+// Volume
+i_vol_mult  = input.float(1.2,  "Spike Multiplier",             group="📦 Volume", step=0.1)
+i_vol_req   = input.bool(false, "Require volume? (false=index)", group="📦 Volume")
+
+// Bollinger Bands
+i_bb_len    = input.int(20,    "BB Length",          group="🎯 Bollinger Bands", minval=1)
+i_bb_std    = input.float(2.0, "BB StdDev",          group="🎯 Bollinger Bands", step=0.1)
+i_bb_exp    = input.float(1.05,"Expansion threshold", group="🎯 Bollinger Bands", step=0.01)
+
+// VWAP
+i_vwap_band = input.float(0.002, "Dead-band % (skip if too close)", group="🔷 VWAP", step=0.001)
+
+// Signal Gate
+i_min_conf  = input.int(5, "Min confirmations (of 8)", group="🚦 Signal Gate", minval=1, maxval=8)
+
+// SL & Target
+i_sl_mult   = input.float(1.2, "SL ATR multiplier",      group="🛑 SL & Target", step=0.1)
+i_tgt_mult  = input.float(2.5, "Full target ATR mult",   group="🛑 SL & Target", step=0.1)
+i_part_mult = input.float(1.0, "Partial target ATR mult", group="🛑 SL & Target", step=0.1)
+
+// Trailing SL
+i_trail_trig = input.float(1.0, "Trail trigger (ATR profit)", group="🔁 Trailing SL", step=0.1)
+i_trail_be   = input.float(1.01,"Breakeven factor (after partial)", group="🔁 Trailing SL", step=0.001)
+i_trail_pct  = input.float(0.87,"Trail factor before partial (e.g. 0.87 = 13% below peak)", group="🔁 Trailing SL", step=0.01)
+i_trail_pct2 = input.float(0.82,"Trail factor after partial  (e.g. 0.82 = 18% below peak)", group="🔁 Trailing SL", step=0.01)
+
+// Time Filter
+i_use_time  = input.bool(true, "Enable time filter",  group="⏰ Time Filter")
+i_t_sh      = input.int(9,  "Start hour",   group="⏰ Time Filter", minval=9,  maxval=15)
+i_t_sm      = input.int(20, "Start minute", group="⏰ Time Filter", minval=0,  maxval=59)
+i_t_eh      = input.int(14, "End hour",     group="⏰ Time Filter", minval=9,  maxval=15)
+i_t_em      = input.int(45, "End minute",   group="⏰ Time Filter", minval=0,  maxval=59)
+
+// Display
+i_show_ema   = input.bool(true,  "Show EMAs",             group="🖥 Display")
+i_show_vwap  = input.bool(true,  "Show VWAP",             group="🖥 Display")
+i_show_st    = input.bool(true,  "Show Supertrend",       group="🖥 Display")
+i_show_bb    = input.bool(false, "Show Bollinger Bands",  group="🖥 Display")
+i_show_lines = input.bool(true,  "Show SL/Target lines",  group="🖥 Display")
+i_show_table = input.bool(true,  "Show confirmation table", group="🖥 Display")
+i_show_score = input.bool(true,  "Show score on label",   group="🖥 Display")
+
+// ============================================================================
+// ─── INDICATORS ─────────────────────────────────────────────────────────────
+// ============================================================================
+
+// EMAs
+ef = ta.ema(close, i_ema_fast)
+em = ta.ema(close, i_ema_mid)
+es = ta.ema(close, i_ema_slow)
+et = ta.ema(close, i_ema_trend)
+
+plot(i_show_ema ? ef : na, "EMA 9",   color=color.new(color.yellow, 0),  linewidth=1)
+plot(i_show_ema ? em : na, "EMA 21",  color=color.new(color.orange, 0),  linewidth=1)
+plot(i_show_ema ? es : na, "EMA 50",  color=color.new(color.blue,   20), linewidth=1)
+plot(i_show_ema ? et : na, "EMA 200", color=color.new(color.gray,   30), linewidth=2)
+
+// ATR
+atr = ta.rma(ta.tr(true), i_adx_len)
+
+// RSI
+rsi = ta.rsi(close, i_rsi_len)
+
+// ADX + DI
+[diP, diM, adxV] = ta.dmi(i_adx_len, i_adx_len)
+
+// Supertrend
+[st_val, st_dir] = ta.supertrend(i_st_mult, i_st_atr)
+st_bull = st_dir < 0
+st_bear = st_dir > 0
+plot(i_show_st ? st_val : na, "Supertrend", color=st_bull ? color.new(color.green, 20) : color.new(color.red, 20), linewidth=2, style=plot.style_line)
+
+// VWAP
+vwap = ta.vwap(hlc3)
+plot(i_show_vwap ? vwap : na, "VWAP", color=color.new(color.purple, 0), linewidth=1)
+
+// Bollinger Bands
+bb_mid = ta.sma(close, i_bb_len)
+bb_dev = ta.stdev(close, i_bb_len)
+bb_up  = bb_mid + i_bb_std * bb_dev
+bb_dn  = bb_mid - i_bb_std * bb_dev
+bb_bw  = (bb_up - bb_dn) / bb_mid
+bb_bwa = ta.sma(bb_bw, i_bb_len)
+bb_exp = bb_bw > bb_bwa * i_bb_exp
+
+plot(i_show_bb ? bb_up  : na, "BB Upper", color=color.new(color.silver, 50), linewidth=1)
+plot(i_show_bb ? bb_dn  : na, "BB Lower", color=color.new(color.silver, 50), linewidth=1)
+plot(i_show_bb ? bb_mid : na, "BB Mid",   color=color.new(color.silver, 70), linewidth=1)
+
+// Volume
+vol_avg   = ta.sma(volume, 20)
+vol_spike = volume > vol_avg * i_vol_mult
+
+// StochRSI
+srsi_raw = ta.stoch(rsi, rsi, rsi, i_rsi_len)
+srsi_k   = ta.sma(srsi_raw, 3)
+srsi_d   = ta.sma(srsi_k, 3)
+srsi_bull = srsi_k > srsi_d and srsi_k < 80
+srsi_bear = srsi_k < srsi_d and srsi_k > 20
+
+// ============================================================================
+// ─── TIME FILTER ────────────────────────────────────────────────────────────
+// ============================================================================
+bar_min   = hour * 60 + minute
+start_min = i_t_sh * 60 + i_t_sm
+end_min   = i_t_eh * 60 + i_t_em
+in_time   = not i_use_time or (bar_min >= start_min and bar_min <= end_min)
+
+// ============================================================================
+// ─── 8 CONFIRMATIONS ────────────────────────────────────────────────────────
+// ============================================================================
+
+// EMA slope
+ef_bull = ef > ef[1] and ef[1] > ef[2]
+ef_bear = ef < ef[1] and ef[1] < ef[2]
+
+// E — EMA cross
+cross_up = ta.crossover(ef,  em)
+cross_dn = ta.crossunder(ef, em)
+
+// T — Trend
+bull_trend = close > et and ef > em and em > es and ef_bull
+bear_trend = close < et and ef < em and em < es and ef_bear
+
+// V — VWAP
+vwap_dist  = math.abs(close - vwap) / vwap
+vwap_close = vwap_dist < i_vwap_band
+vwap_bull  = close > vwap * (1 + i_vwap_band) and not vwap_close
+vwap_bear  = close < vwap * (1 - i_vwap_band) and not vwap_close
+
+// R — RSI + StochRSI
+rsi_bull = rsi > 42 and rsi < i_rsi_ob and srsi_bull
+rsi_bear = rsi > i_rsi_os and rsi < 58 and srsi_bear
+
+// A — ADX + DI
+adx_ok   = adxV > i_adx_thr
+adx_bull = adx_ok and diP > diM
+adx_bear = adx_ok and diM > diP
+
+// B — BB expanding
+no_squeeze = bb_exp
+
+// ============================================================================
+// ─── CONFIRMATION COUNTS ────────────────────────────────────────────────────
+// ============================================================================
+ce_e = cross_up    ? 1 : 0
+ce_t = bull_trend  ? 1 : 0
+ce_s = st_bull     ? 1 : 0
+ce_v = vwap_bull   ? 1 : 0
+ce_r = rsi_bull    ? 1 : 0
+ce_a = adx_bull    ? 1 : 0
+ce_l = vol_spike   ? 1 : 0
+ce_b = no_squeeze  ? 1 : 0
+
+pe_e = cross_dn    ? 1 : 0
+pe_t = bear_trend  ? 1 : 0
+pe_s = st_bear     ? 1 : 0
+pe_v = vwap_bear   ? 1 : 0
+pe_r = rsi_bear    ? 1 : 0
+pe_a = adx_bear    ? 1 : 0
+pe_l = vol_spike   ? 1 : 0
+pe_b = no_squeeze  ? 1 : 0
+
+ce_cnt = i_vol_req ? (ce_e+ce_t+ce_s+ce_v+ce_r+ce_a+ce_l+ce_b) : (ce_e+ce_t+ce_s+ce_v+ce_r+ce_a+ce_b)
+pe_cnt = i_vol_req ? (pe_e+pe_t+pe_s+pe_v+pe_r+pe_a+pe_l+pe_b) : (pe_e+pe_t+pe_s+pe_v+pe_r+pe_a+pe_b)
+min_r  = i_vol_req ? i_min_conf : i_min_conf - 1
+
+buy_ok  = ce_cnt >= min_r and in_time and not vwap_close
+sell_ok = pe_cnt >= min_r and in_time and not vwap_close
+buy_ok2  = buy_ok  and (not sell_ok or ce_cnt >= pe_cnt)
+sell_ok2 = sell_ok and (not buy_ok  or pe_cnt >  ce_cnt)
+
+// ============================================================================
+// ─── SCORE 0–10 ─────────────────────────────────────────────────────────────
+// ============================================================================
+score_ce = math.min(ce_cnt + (ef_bull ? 1 : 0) + (srsi_bull ? 1 : 0), 10)
+score_pe = math.min(pe_cnt + (ef_bear ? 1 : 0) + (srsi_bear ? 1 : 0), 10)
+
+// ============================================================================
+// ─── TRADE STATE MACHINE ────────────────────────────────────────────────────
+// ============================================================================
+var float  entry_px   = na
+var float  sl_px      = na
+var float  part_px    = na
+var float  tgt_px     = na
+var float  trail_sl   = na
+var float  peak_px    = na
+var bool   in_long    = false
+var bool   in_short   = false
+var bool   part_done  = false
+var string trade_dir  = ""
+var int    bar_since_exit = 0
+
+bar_since_exit := (in_long or in_short) ? 0 : bar_since_exit + 1
+reentry_ok = bar_since_exit >= 3
+
+new_long  = buy_ok2  and not in_long  and not in_short and reentry_ok
+new_short = sell_ok2 and not in_short and not in_long  and reentry_ok
+
+// ── Entry ────────────────────────────────────────────────────────────────────
+if new_long
+    entry_px  := close
+    sl_px     := close - atr * i_sl_mult
+    part_px   := close + atr * i_part_mult
+    tgt_px    := close + atr * i_tgt_mult
+    trail_sl  := close - atr * i_sl_mult
+    peak_px   := close
+    in_long   := true
+    part_done := false
+    trade_dir := "CE"
+
+if new_short
+    entry_px  := close
+    sl_px     := close + atr * i_sl_mult
+    part_px   := close - atr * i_part_mult
+    tgt_px    := close - atr * i_tgt_mult
+    trail_sl  := close + atr * i_sl_mult
+    peak_px   := close
+    in_short  := true
+    part_done := false
+    trade_dir := "PE"
+
+// ── Peak tracking ────────────────────────────────────────────────────────────
+if in_long or in_short
+    peak_px := math.max(peak_px, close)
+
+// ── Trail SL ─────────────────────────────────────────────────────────────────
+if in_long and close > entry_px
+    tf      = part_done ? i_trail_pct2 : i_trail_pct
+    new_tsl = close * tf
+    if new_tsl > trail_sl
+        trail_sl := new_tsl
+
+if in_short and close < entry_px
+    tf      = part_done ? (2 - i_trail_pct2) : (2 - i_trail_pct)
+    new_tsl = close * tf
+    if new_tsl < trail_sl
+        trail_sl := new_tsl
+
+// ── Partial exit ─────────────────────────────────────────────────────────────
+var bool part_hit = false
+part_hit := false
+
+if in_long and not part_done and close >= part_px
+    part_done := true
+    part_hit  := true
+    trail_sl  := entry_px * i_trail_be
+    sl_px     := entry_px * i_trail_be
+
+if in_short and not part_done and close <= part_px
+    part_done := true
+    part_hit  := true
+    trail_sl  := entry_px * (2 - i_trail_be)
+    sl_px     := entry_px * (2 - i_trail_be)
+
+// ── Exit conditions ──────────────────────────────────────────────────────────
+sl_hit   = (in_long  and close <= trail_sl) or (in_short and close >= trail_sl)
+tgt_hit  = (in_long  and close >= tgt_px)   or (in_short and close <= tgt_px)
+eod_exit = (hour == 15 and minute >= 10)
+exit_now = (in_long or in_short) and (sl_hit or tgt_hit or eod_exit)
+
+exit_reason = tgt_hit ? "TARGET ✅" : sl_hit ? (part_done ? "TRAIL SL 🔁" : "SL HIT 🛑") : "EOD ⏰"
+
+var float exit_px = na
+if exit_now
+    exit_px       := close
+    bar_since_exit := 0
+    in_long       := false
+    in_short      := false
+
+// ============================================================================
+// ─── PLOT SL / TARGET LINES ─────────────────────────────────────────────────
+// ============================================================================
+in_trade = in_long or in_short
+
+plot(i_show_lines and in_trade ? sl_px    : na, "SL",             color=color.new(color.red,    0),  linewidth=1, style=plot.style_linebr)
+plot(i_show_lines and in_trade ? trail_sl : na, "Trail SL",       color=color.new(color.orange, 0),  linewidth=1, style=plot.style_linebr)
+plot(i_show_lines and in_trade ? part_px  : na, "Partial Target", color=color.new(color.teal,   0),  linewidth=1, style=plot.style_linebr)
+plot(i_show_lines and in_trade ? tgt_px   : na, "Full Target",    color=color.new(color.lime,   0),  linewidth=2, style=plot.style_linebr)
+plot(in_trade ? entry_px : na,                  "Entry",          color=color.new(color.white,  30), linewidth=1, style=plot.style_linebr)
+
+// ============================================================================
+// ─── LABELS ─────────────────────────────────────────────────────────────────
+// ============================================================================
+ce_conf = (ce_e==1?"E":"·")+(ce_t==1?"T":"·")+(ce_s==1?"S":"·")+(ce_v==1?"V":"·")+(ce_r==1?"R":"·")+(ce_a==1?"A":"·")+(ce_l==1?"L":"·")+(ce_b==1?"B":"·")
+pe_conf = (pe_e==1?"E":"·")+(pe_t==1?"T":"·")+(pe_s==1?"S":"·")+(pe_v==1?"V":"·")+(pe_r==1?"R":"·")+(pe_a==1?"A":"·")+(pe_l==1?"L":"·")+(pe_b==1?"B":"·")
+
+sc_txt_ce = i_show_score ? "\nScore: " + str.tostring(score_ce) + "/10" : ""
+sc_txt_pe = i_show_score ? "\nScore: " + str.tostring(score_pe) + "/10" : ""
+
+// BUY CE
+if new_long
+    label.new(bar_index, low,
+      text  = "▲ BUY CE\n" + ce_conf + sc_txt_ce +
+              "\nEntry : " + str.tostring(close,   "#.##") +
+              "\nSL    : " + str.tostring(sl_px,   "#.##") +
+              "\nP.Tgt : " + str.tostring(part_px, "#.##") +
+              "\nTarget: " + str.tostring(tgt_px,  "#.##"),
+      color     = color.new(color.green, 5),
+      textcolor = color.white,
+      style     = label.style_label_up,
+      size      = size.normal)
+
+// BUY PE
+if new_short
+    label.new(bar_index, high,
+      text  = "▼ BUY PE\n" + pe_conf + sc_txt_pe +
+              "\nEntry : " + str.tostring(close,   "#.##") +
+              "\nSL    : " + str.tostring(sl_px,   "#.##") +
+              "\nP.Tgt : " + str.tostring(part_px, "#.##") +
+              "\nTarget: " + str.tostring(tgt_px,  "#.##"),
+      color     = color.new(color.red, 5),
+      textcolor = color.white,
+      style     = label.style_label_down,
+      size      = size.normal)
+
+// Partial exit
+if part_hit
+    label.new(bar_index, in_long ? high : low,
+      text      = "50% EXIT\n" + str.tostring(close, "#.##"),
+      color     = color.new(color.teal, 10),
+      textcolor = color.white,
+      style     = in_long ? label.style_label_down : label.style_label_up,
+      size      = size.small)
+
+// Full exit
+if exit_now
+    pnl   = trade_dir == "CE" ? close - entry_px : entry_px - close
+    psign = pnl >= 0 ? "+" : ""
+    ecol  = tgt_hit ? color.new(color.lime, 10) : sl_hit ? color.new(color.red, 10) : color.new(color.gray, 10)
+    label.new(bar_index, trade_dir == "CE" ? high : low,
+      text      = exit_reason + "\n" + str.tostring(close, "#.##") +
+                  "\nPnL: " + psign + str.tostring(pnl, "#.##") + " pts",
+      color     = ecol,
+      textcolor = color.white,
+      style     = trade_dir == "CE" ? label.style_label_down : label.style_label_up,
+      size      = size.small)
+
+// ============================================================================
+// ─── BACKGROUND ─────────────────────────────────────────────────────────────
+// ============================================================================
+bgcolor(in_long  ? color.new(color.green, 93) : na, title="CE trade bg")
+bgcolor(in_short ? color.new(color.red,   93) : na, title="PE trade bg")
+bgcolor(part_done and in_trade ? color.new(color.teal, 93) : na, title="After partial bg")
+
+// ============================================================================
+// ─── SHAPES ─────────────────────────────────────────────────────────────────
+// ============================================================================
+plotshape(new_long,  "CE Arrow", shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(new_short, "PE Arrow", shape.triangledown, location.abovebar, color.red,   size=size.small)
+plotshape(tgt_hit  and exit_now, "Target",  shape.circle,   location.abovebar, color.lime,  size=size.tiny)
+plotshape(sl_hit   and exit_now, "SL Hit",  shape.xcross,   location.abovebar, color.red,   size=size.tiny)
+plotshape(eod_exit and exit_now, "EOD",     shape.square,   location.abovebar, color.gray,  size=size.tiny)
+plotshape(part_hit,              "Partial", shape.diamond,  location.abovebar, color.teal,  size=size.tiny)
+
+// ============================================================================
+// ─── CONFIRMATION TABLE ─────────────────────────────────────────────────────
+// ============================================================================
+var table tbl = table.new(position.top_right, 4, 12, bgcolor=color.new(color.black, 72), border_width=1, border_color=color.new(color.gray, 60))
+
+if i_show_table and barstate.islast
+
+    // Header
+    table.cell(tbl, 0, 0, "CHECK",  text_color=color.white,  bgcolor=color.new(color.navy, 25), text_size=size.small)
+    table.cell(tbl, 1, 0, "CE ▲",   text_color=color.green,  bgcolor=color.new(color.navy, 25), text_size=size.small)
+    table.cell(tbl, 2, 0, "PE ▼",   text_color=color.red,    bgcolor=color.new(color.navy, 25), text_size=size.small)
+    table.cell(tbl, 3, 0, "VALUE",  text_color=color.yellow, bgcolor=color.new(color.navy, 25), text_size=size.small)
+
+    // Data
+    checks = array.from("E  EMA Cross", "T  Trend", "S  SuperTrend", "V  VWAP", "R  RSI+SRSI", "A  ADX+DI", "L  Volume", "B  BB Expand")
+    ce_arr = array.from(ce_e, ce_t, ce_s, ce_v, ce_r, ce_a, ce_l, ce_b)
+    pe_arr = array.from(pe_e, pe_t, pe_s, pe_v, pe_r, pe_a, pe_l, pe_b)
+    vals   = array.from(
+              str.tostring(ef, "#.0") + " / " + str.tostring(em, "#.0"),
+              close > et ? "Above EMA200" : "Below EMA200",
+              st_bull ? "Bullish 🟢" : "Bearish 🔴",
+              str.tostring(close - vwap, "#.0") + " from VWAP",
+              "RSI " + str.tostring(rsi, "#.1"),
+              "ADX " + str.tostring(adxV, "#.1"),
+              str.tostring(math.round(volume / vol_avg * 10) / 10) + "x avg",
+              bb_bw > bb_bwa ? "Expanding 🟢" : "Squeeze 🔴")
+
+    for i = 0 to 7
+        row    = i + 1
+        cv     = array.get(ce_arr, i)
+        pv     = array.get(pe_arr, i)
+        cbg    = cv == 1 ? color.new(color.green, 65) : color.new(color.red, 80)
+        pbg    = pv == 1 ? color.new(color.green, 65) : color.new(color.red, 80)
+        table.cell(tbl, 0, row, array.get(checks, i), text_color=color.white,               bgcolor=color.new(color.black, 72), text_size=size.small)
+        table.cell(tbl, 1, row, cv == 1 ? "✓ YES" : "✗ NO", text_color=cv==1?color.green:color.red, bgcolor=cbg, text_size=size.small)
+        table.cell(tbl, 2, row, pv == 1 ? "✓ YES" : "✗ NO", text_color=pv==1?color.green:color.red, bgcolor=pbg, text_size=size.small)
+        table.cell(tbl, 3, row, array.get(vals, i),           text_color=color.yellow,              bgcolor=color.new(color.black, 72), text_size=size.small)
+
+    // Score row
+    table.cell(tbl, 0, 9, "SCORE",  text_color=color.white, bgcolor=color.new(color.navy, 25), text_size=size.small)
+    table.cell(tbl, 1, 9, str.tostring(ce_cnt) + " / " + str.tostring(min_r) + "   [" + str.tostring(score_ce) + "/10]", text_color=ce_cnt>=min_r?color.green:color.red, bgcolor=color.new(color.black,72), text_size=size.small)
+    table.cell(tbl, 2, 9, str.tostring(pe_cnt) + " / " + str.tostring(min_r) + "   [" + str.tostring(score_pe) + "/10]", text_color=pe_cnt>=min_r?color.green:color.red, bgcolor=color.new(color.black,72), text_size=size.small)
+    table.cell(tbl, 3, 9, in_time ? "✓ IN TIME" : "✗ OUT",  text_color=in_time?color.green:color.red, bgcolor=color.new(color.black,72), text_size=size.small)
+
+    // Signal row
+    sig_txt = buy_ok2 ? "▲ BUY CE" : sell_ok2 ? "▼ BUY PE" : "── NO SIGNAL"
+    sig_col = buy_ok2 ? color.green : sell_ok2 ? color.red : color.gray
+    table.cell(tbl, 0, 10, "SIGNAL", text_color=color.white, bgcolor=color.new(color.navy, 25), text_size=size.small)
+    table.cell(tbl, 1, 10, sig_txt,  text_color=sig_col,     bgcolor=color.new(color.black, 72), text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 2, 10, "",       text_color=color.white, bgcolor=color.new(color.black, 72), text_size=size.small)
+    table.cell(tbl, 3, 10, "",       text_color=color.white, bgcolor=color.new(color.black, 72), text_size=size.small)
+
+    // Position row
+    pos_txt = in_long  ? "LONG CE  @ " + str.tostring(entry_px, "#.##") :
+              in_short ? "SHORT PE @ " + str.tostring(entry_px, "#.##") :
+                         "NO POSITION"
+    pos_col = in_long ? color.green : in_short ? color.red : color.gray
+    sl_txt  = in_trade ? "SL: " + str.tostring(trail_sl, "#.##") : "─"
+    table.cell(tbl, 0, 11, "POSITION", text_color=color.white,  bgcolor=color.new(color.navy, 25), text_size=size.small)
+    table.cell(tbl, 1, 11, pos_txt,    text_color=pos_col,      bgcolor=color.new(color.black, 72), text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 2, 11, part_done and in_trade ? "PARTIAL ✓" : in_trade ? "FULL QTY" : "─", text_color=color.teal,   bgcolor=color.new(color.black, 72), text_size=size.small)
+    table.cell(tbl, 3, 11, sl_txt,     text_color=color.orange, bgcolor=color.new(color.black, 72), text_size=size.small)
+
+// ============================================================================
+// ─── ALERTS (optional — create in TradingView alert dialog) ─────────────────
+// ============================================================================
+alertcondition(new_long,  "BUY CE Signal",  "BUY CE — Entry: {{close}}")
+alertcondition(new_short, "BUY PE Signal",  "BUY PE — Entry: {{close}}")
+alertcondition(part_hit,  "Partial Exit",   "50%% exit at {{close}}")
+alertcondition(tgt_hit and exit_now, "Target Hit", "TARGET HIT at {{close}}")
+alertcondition(sl_hit  and exit_now, "SL Hit",     "SL HIT at {{close}}")
+alertcondition(eod_exit and exit_now, "EOD Exit",  "EOD square-off at {{close}}")
