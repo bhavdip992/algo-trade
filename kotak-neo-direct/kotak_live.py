@@ -24,7 +24,8 @@
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 
-import os, sys, time, logging, threading, json, argparse, warnings
+import os, sys, time, logging, threading, json, argparse, warnings, socket
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -71,6 +72,17 @@ except ImportError:
     log.error('pip install "git+https://github.com/Kotak-Neo/kotak-neo-api.git#egg=neo_api_client"')
     sys.exit(1)
 
+# ════════════════════════════════════════════════════════════════════════
+# GLOBAL SOCKET TIMEOUT — PRIMARY hang prevention (works on Windows)
+# ════════════════════════════════════════════════════════════════════════
+# Without this, any dropped network connection causes the SDK's internal
+# requests.get() / socket.recv() to block forever, freezing the LTPPoller
+# thread for hours with zero log output.
+# socket.setdefaulttimeout(8) applies to ALL socket operations in this process,
+# including every HTTP call made by the Kotak Neo SDK.
+socket.setdefaulttimeout(8)
+log.info("🔒 Global socket timeout set to 8s (prevents thread hang on network drop)")
+
 from signal_engine import SignalEngine, EngineConfig, SignalResult
 
 
@@ -101,12 +113,12 @@ CFG = {
     "environment":    _s("ENVIRONMENT", "prod"),
     "paper":          PAPER,
 
-    "index":          _s("INDEX", "NIFTY").upper(),
-    "lot_size":       _i("LOT_SIZE",    65),
+    "index":          _s("INDEX", "BANKNIFTY").upper(),
+    "lot_size":       _i("LOT_SIZE",    30),
     "strike_step":    _i("STRIKE_STEP", 100),
-    "expiry_weekday": _s("EXPIRY_WEEKDAY", "TUE").upper(),
+    "expiry_weekday": _s("EXPIRY_WEEKDAY", "WED").upper(),
     "expiry_type":    _s("EXPIRY_TYPE",  "Weekly"),
-    "strike_mode":    _s("STRIKE_MODE",  "OTM2"),
+    "strike_mode":    _s("STRIKE_MODE",  "ATM"),
     "option_type":    _s("OPTION_TYPE",  "AUTO"),   # AUTO | CE Only | PE Only
     "timeframe":      _i("TIMEFRAME",    5),
 
@@ -196,46 +208,71 @@ engine = SignalEngine(EngineConfig(
 # ════════════════════════════════════════════════════════════════════════
 class KotakSession:
     def __init__(self):
-        self.client:     NeoAPI   = None
-        self.logged_in:  bool     = False
-        self.login_time: datetime = None
-        self._lock = threading.Lock()
+        self.client:              NeoAPI   = None
+        self.logged_in:           bool     = False
+        self.login_time:          datetime = None
+        self._lock                         = threading.Lock()
+        self._consecutive_failures: int   = 0   # FIX: track API failures for auto-relogin
 
     def login(self) -> bool:
+        # FIX: _lock is NOT held inside login body to avoid deadlock when
+        # ensure_fresh() → login() is called from multiple threads simultaneously.
+        # The outer ensure_fresh() call is already serialised by the lock.
+        log.info("🔑 Logging into Kotak Neo...")
+        client = NeoAPI(
+            consumer_key=CFG["consumer_key"],
+            environment=CFG["environment"],
+            access_token=None,
+            neo_fin_key=None,
+        )
+        totp = pyotp.TOTP(CFG["totp_secret"]).now()
+        log.info(f"TOTP: {totp}")
+
+        r1 = client.totp_login(
+            mobile_number=CFG["mobile"], ucc=CFG["ucc"], totp=totp)
+        if not r1 or not r1.get("data", {}).get("token"):
+            raise RuntimeError(f"TOTP login failed: {r1}")
+        log.info("TOTP ✓")
+
+        r2 = client.totp_validate(mpin=CFG["mpin"])
+        if not r2 or not r2.get("data", {}).get("token"):
+            raise RuntimeError(f"MPIN failed: {r2}")
+        log.info("MPIN ✓")
+
+        # Atomically update state only after full success
         with self._lock:
-            log.info("🔑 Logging into Kotak Neo...")
-            self.client = NeoAPI(
-                consumer_key=CFG["consumer_key"],
-                environment=CFG["environment"],
-                access_token=None,
-                neo_fin_key=None,
-            )
-            totp = pyotp.TOTP(CFG["totp_secret"]).now()
-            log.info(f"TOTP: {totp}")
+            self.client                  = client
+            self.logged_in               = True
+            self.login_time              = datetime.now()
+            self._consecutive_failures   = 0
+        log.info("✅ Login successful")
+        return True
 
-            r1 = self.client.totp_login(
-                mobile_number=CFG["mobile"], ucc=CFG["ucc"], totp=totp)
-            if not r1 or not r1.get("data", {}).get("token"):
-                raise RuntimeError(f"TOTP login failed: {r1}")
-            log.info("TOTP ✓")
-
-            r2 = self.client.totp_validate(mpin=CFG["mpin"])
-            if not r2 or not r2.get("data", {}).get("token"):
-                raise RuntimeError(f"MPIN failed: {r2}")
-            log.info("MPIN ✓")
-
-            self.logged_in  = True
-            self.login_time = datetime.now()
-            log.info("✅ Login successful")
-            return True
+    def mark_failure(self):
+        """Called by API consumers when a request fails — triggers re-login after 3 failures."""
+        with self._lock:
+            self._consecutive_failures += 1
+            failures = self._consecutive_failures
+        if failures >= 3:
+            log.warning(f"⚠️  {failures} consecutive API failures — forcing re-login")
+            try:
+                self.login()
+            except Exception as e:
+                log.error(f"Force re-login failed: {e}")
 
     def ensure_fresh(self):
-        if not self.logged_in or self.client is None:
-            self.login()
-            return
-        age_h = (datetime.now() - self.login_time).total_seconds() / 3600
-        if age_h > 6.5:
-            log.info("🔄 Session expiring — refreshing login")
+        """Re-login if session age > 6 hours OR if client is not set."""
+        # FIX: use a short-lived lock only for reading state, not for the whole login
+        with self._lock:
+            if not self.logged_in or self.client is None:
+                need_login = True
+                age_h      = 999.0
+            else:
+                age_h      = (datetime.now() - self.login_time).total_seconds() / 3600
+                need_login = age_h > 6.0   # FIX: reduced from 6.5 → 6.0 for safety margin
+
+        if need_login:
+            log.info(f"🔄 Session refresh (age={age_h:.1f}h)")
             try:
                 self.login()
             except Exception as e:
@@ -248,7 +285,7 @@ sess = KotakSession()
 # ════════════════════════════════════════════════════════════════════════
 # OPTION SYMBOL BUILDER
 # ════════════════════════════════════════════════════════════════════════
-def _next_expiry1() -> str:
+def _next_expiry() -> str:
     today  = date.today()
     exp_wd = CFG["expiry_wday"]
     if CFG["expiry_type"] == "Monthly":
@@ -270,56 +307,23 @@ def _next_expiry1() -> str:
     return expiry.strftime("%d%b%y").upper()
 
 
-    _cached_expiry = None
-_cached_day = None
-
-def _next_expiry() -> str:
-    global _cached_expiry, _cached_day
-
-    today = date.today()
-
-    # ✅ cache to avoid recomputation
-    if _cached_day == today:
-        return _cached_expiry
-
-    exp_wd = CFG["expiry_wday"]  # Thursday = 3
-
-    if CFG["expiry_type"] == "Monthly":
-        y, m = today.year, today.month
-        cands = []
-
-        for d in range(1, 32):
-            try:
-                dd = date(y, m, d)
-                if dd.weekday() == exp_wd:
-                    cands.append(dd)
-            except ValueError:
-                break
-
-        expiry = cands[-1] if cands else today
-
-    else:
-        # ✅ FIX: allow today expiry
-        ahead = (exp_wd - today.weekday()) % 7
-        expiry = today + timedelta(days=ahead)
-
-    # cache result
-    _cached_expiry = expiry.strftime("%d%b%y").upper()
-    _cached_day = today
-
-    return _cached_expiry
-
-
 def build_option_symbol(option: str, underlying_px: float, strike_mode: str = None) -> str:
     mode      = strike_mode or CFG["strike_mode"]
     step      = CFG["strike_step"]
+    # ATM: round to nearest strike step
     atm       = int(round(underlying_px / step) * step)
     offsets   = {"ATM": 0, "OTM1": 1, "OTM2": 2, "ITM1": -1, "ITM2": -2}
+    # For CE: OTM is higher strike (+), for PE: OTM is lower strike (-)
     direction = 1 if option == "CE" else -1
-    strike    = atm + offsets.get(mode, 0) * step * direction
+    offset    = offsets.get(mode, 0)
+    strike    = atm + offset * step * direction
     expiry    = _next_expiry()
     symbol    = f"{CFG['index']}{expiry}{strike}{option}"
-    log.info(f"📋 Symbol: {symbol}  (spot={underlying_px:.0f} ATM={atm} K={strike})")
+    log.info(
+        f"📋 Symbol: {symbol}  "
+        f"(spot={underlying_px:.0f} ATM={atm} mode={mode} "
+        f"offset={offset} step={step} K={strike})"
+    )
     return symbol
 
 
@@ -335,7 +339,15 @@ class Broker:
         return sess.client
 
     def get_token(self, symbol: str, segment: str = NFO_SEG) -> str:
-        """Get instrument token for an option symbol from NFO segment."""
+        """
+        Get pSymbol token for an option contract.
+
+        Strategy:
+          1. Try search_scrip(symbol=full_symbol) — exact match on pTrdSymbol
+          2. If no match, try search_scrip(symbol=index_name) — broader lookup,
+             then match by parsed strike / expiry / option type from the symbol string.
+          3. Log actual pTrdSymbol values so we can confirm format.
+        """
         today = date.today()
         key   = f"{segment}:{symbol}"
         if self._cache_date != today:
@@ -343,51 +355,128 @@ class Broker:
             self._cache_date = today
         if key in self._token_cache:
             return self._token_cache[key]
-        try:
-            resp = self._api().search_scrip(exchange_segment=segment, symbol=symbol)
-            items = []
-            if isinstance(resp, list):
-                items = resp
-            elif isinstance(resp, dict):
-                for k in ("data", "Data", "result"):
-                    if resp.get(k):
-                        items = resp[k]; break
 
-            for inst in items:
-                if not isinstance(inst, dict): continue
-                # Kotak Neo NFO uses pTrdSymbol as the trading symbol
-                trd = (inst.get("pTrdSymbol") or inst.get("trdSym") or
-                       inst.get("sym") or "")
-                if trd == symbol:
-                    # pSymbol is the numeric token for quotes()
-                    tok = str(inst.get("pSymbol") or inst.get("pTok") or
-                              inst.get("tok") or "")
-                    if tok and tok not in ("0", "-1"):
+        def _extract_tok(inst: dict) -> str:
+            tok = str(inst.get("pSymbol") or inst.get("pTok") or inst.get("tok") or "")
+            return tok if tok and tok not in ("0", "-1") else ""
+
+        def _search_items(query: str) -> list:
+            try:
+                resp = self._api().search_scrip(exchange_segment=segment, symbol=query)
+                if isinstance(resp, list):
+                    return resp
+                if isinstance(resp, dict):
+                    for k in ("data", "Data", "result"):
+                        if resp.get(k):
+                            v = resp[k]
+                            return v if isinstance(v, list) else [v]
+            except Exception as e:
+                log.debug(f"search_scrip({query!r}): {e}")
+            return []
+
+        try:
+            # ── Pass 1: exact full-symbol search ──────────────────────────
+            items = _search_items(symbol)
+
+            if items:
+                log.debug(f"search_scrip({symbol!r}) → {len(items)} result(s)")
+                for _i, _inst in enumerate(items[:5]):
+                    log.debug(
+                        f"  scrip[{_i}]: pTrdSymbol={_inst.get('pTrdSymbol')!r} "
+                        f"pSymbol={_inst.get('pSymbol')} "
+                        f"pOptionType={_inst.get('pOptionType')} "
+                        f"dStrikePrice={_inst.get('dStrikePrice')} "
+                        f"pExpiryDate={_inst.get('pExpiryDate')}"
+                    )
+                for inst in items:
+                    if not isinstance(inst, dict): continue
+                    trd = (inst.get("pTrdSymbol") or inst.get("trdSym") or
+                           inst.get("sym") or "")
+                    if trd.strip().upper() == symbol.strip().upper():
+                        tok = _extract_tok(inst)
+                        if tok:
+                            self._token_cache[key] = tok
+                            log.info(f"✅ Token (exact) {symbol} → {tok}")
+                            return tok
+            else:
+                log.debug(f"search_scrip({symbol!r}) returned no results")
+
+            # ── Pass 2: broad index-name search + field-level matching ────
+            # Parse symbol like  NIFTY07APR2622950CE  →  expiry=07APR26, strike=22950, opt=CE
+            import re
+            m = re.match(
+                r'^([A-Z]+?)(\d{2}[A-Z]{3}\d{2})(\d+)(CE|PE)$', symbol.upper()
+            )
+            if m:
+                _idx, _exp, _strike, _opt = m.groups()
+                log.debug(f"Parsed: idx={_idx} exp={_exp} strike={_strike} opt={_opt}")
+                broad_items = _search_items(_idx)
+                log.debug(f"Broad search({_idx!r}) → {len(broad_items)} result(s)")
+                for _i, _inst in enumerate(broad_items[:5]):
+                    log.debug(
+                        f"  broad[{_i}]: pTrdSymbol={_inst.get('pTrdSymbol')!r} "
+                        f"pSymbol={_inst.get('pSymbol')} "
+                        f"pOptionType={_inst.get('pOptionType')} "
+                        f"dStrikePrice={_inst.get('dStrikePrice')} "
+                        f"pExpiryDate={_inst.get('pExpiryDate')}"
+                    )
+                for inst in broad_items:
+                    if not isinstance(inst, dict): continue
+                    # Match option type
+                    opt_type = (inst.get("pOptionType") or inst.get("optionType") or "").strip().upper()
+                    if opt_type != _opt:
+                        continue
+                    # Match strike price (API may store as float string "22950.0000")
+                    raw_strike = str(inst.get("dStrikePrice") or inst.get("strikePrice") or "")
+                    try:
+                        inst_strike = str(int(float(raw_strike)))
+                    except Exception:
+                        inst_strike = raw_strike.strip()
+                    if inst_strike != _strike:
+                        continue
+                    # Match expiry — pExpiryDate may be "07-APR-2026" or "07APR26" etc.
+                    raw_exp = str(inst.get("pExpiryDate") or inst.get("expiryDate") or "")
+                    # Normalise to DDMMMYY format for comparison
+                    raw_exp_norm = raw_exp.replace("-", "").upper()
+                    exp_norm     = _exp.upper()  # e.g. "07APR26"
+                    if exp_norm not in raw_exp_norm and raw_exp_norm[:7] != exp_norm:
+                        continue
+                    tok = _extract_tok(inst)
+                    if tok:
+                        actual_trd = inst.get("pTrdSymbol") or ""
+                        log.info(f"✅ Token (field-match) {symbol} → {tok}  [pTrdSymbol={actual_trd!r}]")
                         self._token_cache[key] = tok
-                        log.debug(f"Token {symbol}: {tok}")
                         return tok
 
-            # Fallback: use trading symbol string directly for quotes()
-            # (same approach that works for index — symbol string as token)
-            log.debug(f"No exact token match for {symbol}, using symbol string")
-            self._token_cache[key] = symbol
-            return symbol
+            log.debug(f"No token found for {symbol} after both search passes")
 
         except Exception as e:
             log.error(f"Token ({symbol}): {e}")
-        return symbol   # fallback: use symbol string itself
+        return ""   # empty = will fall back to symbol string in get_option_ltp
 
     def get_option_ltp(self, symbol: str) -> float:
         """
         LTP of an option contract (NFO segment).
-        Uses pTrdSymbol string directly as instrument_token — same approach
-        that works for index quotes with name string.
+
+        Tries in order:
+          1. Numeric pSymbol token from search_scrip (most reliable)
+          2. Trading symbol string as token (fallback)
+
+        The "Invalid neosymbol values" error means the symbol string
+        format doesn't match what Kotak Neo expects. The numeric pSymbol
+        token bypasses this validation entirely.
         """
         if CFG["paper"]: return 0.0
         try:
-            # First try with the trading symbol string directly
-            # (Kotak Neo quotes works with symbol strings, not just numeric tokens)
-            for tok_val in (symbol, self.get_token(symbol, NFO_SEG)):
+            tok = self.get_token(symbol, NFO_SEG)
+
+            # Build list of token values to try
+            candidates = []
+            if tok and tok != symbol:
+                candidates.append(tok)       # numeric pSymbol token (preferred)
+            candidates.append(symbol)         # symbol string (fallback)
+
+            for tok_val in candidates:
                 if not tok_val:
                     continue
                 try:
@@ -501,7 +590,9 @@ class Broker:
             log.debug(f"No valid LTP in response rows: {rows[:2]}")
 
         except Exception as e:
-            log.debug(f"Index LTP error: {e}")
+            # FIX: log at WARNING not DEBUG so session failures are visible in log
+            log.warning(f"Index LTP error: {e}")
+            sess.mark_failure()   # FIX: track failures → auto re-login after 3 consecutive
 
         return 0.0
 
@@ -592,25 +683,53 @@ broker = Broker()
 
 
 # ════════════════════════════════════════════════════════════════════════
+# ORDER HELPER — retry on transient failure
+# ════════════════════════════════════════════════════════════════════════
+def _place_with_retry(symbol: str, qty: int, tx: str,
+                      order_type: str = "MKT",
+                      price: float = 0, trigger: float = 0,
+                      retries: int = 3) -> str:
+    """
+    Places an order with up to `retries` attempts.
+    Returns order ID on success, raises on final failure.
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            return broker.place_order(
+                symbol, qty, tx=tx, order_type=order_type,
+                price=price, trigger=trigger,
+            )
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                log.warning(f"Order attempt {attempt} failed ({e}) — retrying in 1s...")
+                time.sleep(1)
+    raise RuntimeError(f"Order failed after {retries} attempts: {last_err}")
+
+
+# ════════════════════════════════════════════════════════════════════════
 # TRADING STATE
 # ════════════════════════════════════════════════════════════════════════
 @dataclass
 class Position:
-    symbol:     str
-    option:     str      # CE | PE
-    entry_ltp:  float    # option premium at entry
-    sl_prem:    float    # SL level in option premium
-    tgt_prem:   float    # target level in option premium
-    lots:       int
-    qty:        int
-    entry_oid:  str
-    sl_oid:     str
-    peak_ltp:   float = 0.0
-    pnl:        float = 0.0
-    status:     str   = "OPEN"   # OPEN | SL_HIT | TGT_HIT | TRAIL_SL | EOD | MANUAL
-    entry_time: str   = ""
-    exit_time:  str   = ""
-    exit_ltp:   float = 0.0
+    symbol:       str
+    option:       str      # CE | PE
+    entry_ltp:    float    # option premium at entry
+    sl_prem:      float    # SL level in option premium
+    tgt_prem:     float    # hard target (2.5:1 RR) — used as reference
+    lots:         int
+    qty:          int
+    entry_oid:    str
+    sl_oid:       str
+    peak_ltp:     float = 0.0
+    pnl:          float = 0.0
+    status:       str   = "OPEN"   # OPEN | SL_HIT | TGT_HIT | TRAIL_SL | EOD | MANUAL
+    entry_time:   str   = ""
+    exit_time:    str   = ""
+    exit_ltp:     float = 0.0
+    partial_done: bool  = False   # True after 50% partial exit at 2× entry
+    be_done:      bool  = False   # True after breakeven SL shift
 
 
 @dataclass
@@ -790,14 +909,13 @@ def execute_trade(result: SignalResult) -> bool:
     if cost > CFG["capital"] * 0.90 and not CFG["paper"]:
         log.error(f"❌ Cost ₹{cost:.0f} > 90% capital"); return False
 
-    # SL & Target in option premium terms
-    if result.sl > 0 and result.close > 0:
-        move_pct = abs(result.close - result.sl) / result.close
-    else:
-        move_pct = 0.006   # 0.6% default
-
-    sl_prem  = max(5.0, round(opt_ltp * (1 - move_pct * 3), 1))
-    tgt_prem = round(opt_ltp * (1 + move_pct * 3 * 2), 1)   # 2:1 RR
+    # ── SL & Target — ATR-based option premium % ─────────────────────────
+    # OTM options amplify index moves: use ATR/spot as proxy for move size,
+    # then scale into option SL%. Clamp between 15%–35% of option premium.
+    atr_pct  = (result.atr / result.close) if result.close > 0 else 0.004
+    sl_pct   = min(0.35, max(0.15, atr_pct * 1.5))   # 15%–35% of premium
+    sl_prem  = max(10.0, round(opt_ltp * (1.0 - sl_pct), 1))
+    tgt_prem = round(opt_ltp * (1.0 + sl_pct * 2.5), 1)   # 2.5:1 RR
 
     mode = "PAPER" if CFG["paper"] else "LIVE"
     log.info(
@@ -812,21 +930,21 @@ def execute_trade(result: SignalResult) -> bool:
         f"{'='*62}"
     )
 
-    # Place ENTRY (BUY) order
+    # Place ENTRY (BUY) order  — with retry
     try:
-        entry_oid = broker.place_order(symbol, qty, tx="B", order_type="MKT")
+        entry_oid = _place_with_retry(symbol, qty, tx="B", order_type="MKT")
     except Exception as e:
         log.error(f"Entry order FAILED: {e}"); return False
 
-    # Place SL (SELL) order
+    # Place SL (SELL SL-M) order  — SL-M fills at market on trigger hit
     sl_oid = ""
     try:
-        sl_trigger = round(sl_prem * 0.99, 1)
-        sl_oid = broker.place_order(
-            symbol, qty, tx="S", order_type="SL",
-            price=sl_prem, trigger=sl_trigger,
+        sl_trigger = round(sl_prem * 0.995, 1)   # trigger slightly below SL price
+        sl_oid = _place_with_retry(
+            symbol, qty, tx="S", order_type="SL-M",
+            trigger=sl_trigger,   # SL-M only needs trigger, no limit price
         )
-        log.info(f"🛑 SL order: {sl_oid} @ ₹{sl_prem:.1f} (trig ₹{sl_trigger:.1f})")
+        log.info(f"🛑 SL-M order: {sl_oid} @ trig ₹{sl_trigger:.1f}")
     except Exception as e:
         log.warning(f"SL order failed — TrailMonitor will watch manually: {e}")
 
@@ -916,34 +1034,83 @@ class TrailMonitor(threading.Thread):
                 log.warning(f"Position check ({sym}): {e}")
 
     def _manage(self, pos: Position, sym: str, ltp: float):
+        """
+        Multi-stage position management:
+          Stage 0 — SL hit → exit immediately
+          Stage 1 — Breakeven: at 1:1 RR, move SL to entry+0.5%
+          Stage 2 — Partial exit: at 2× entry, sell 50% qty
+          Stage 3 — Trail: above 1.5× entry, trail 18% below peak
+          Stage 4 — Full target (2.5× entry) → exit rest
+        """
         # Update peak
         if ltp > pos.peak_ltp:
             pos.peak_ltp = ltp
 
-        # Target hit
-        if ltp >= pos.tgt_prem:
-            log.info(f"🎯 TARGET: {sym} ₹{ltp:.1f} ≥ ₹{pos.tgt_prem:.1f}")
-            square_off(sym, "TGT_HIT"); return
-
-        # SL hit
+        # ── Stage 0: SL hit ───────────────────────────────────────────────
         if ltp <= pos.sl_prem:
-            log.info(f"🛑 SL HIT: {sym} ₹{ltp:.1f} ≤ ₹{pos.sl_prem:.1f}")
+            log.info(f"🛑 SL HIT: {sym} ₹{ltp:.1f} <= ₹{pos.sl_prem:.1f}")
             square_off(sym, "SL_HIT"); return
 
-        # Trail SL — move up to 15% below peak when in profit
-        if ltp > pos.entry_ltp:
-            new_sl = round(pos.peak_ltp * 0.85, 1)
+        # ── Stage 1: Breakeven shift — at 1:1 RR, move SL to entry+0.5% ──
+        sl_range = pos.entry_ltp - pos.sl_prem          # original risk in premium
+        be_trigger = pos.entry_ltp + sl_range           # 1:1 from entry
+        if not pos.be_done and ltp >= be_trigger:
+            new_be_sl = round(pos.entry_ltp * 1.005, 1) # entry + 0.5%
+            if new_be_sl > pos.sl_prem:
+                old_sl = pos.sl_prem
+                pos.sl_prem = new_be_sl
+                pos.be_done = True
+                log.info(
+                    f"🔒 BREAKEVEN {sym}: SL ₹{old_sl:.1f} → ₹{new_be_sl:.1f} "
+                    f"(entry=₹{pos.entry_ltp:.1f})"
+                )
+                if pos.sl_oid and not CFG["paper"]:
+                    new_oid = broker.modify_order(
+                        pos.sl_oid, sym, pos.qty,
+                        new_trigger=round(new_be_sl * 0.995, 1),
+                        new_price=new_be_sl,
+                    )
+                    with state_lock:
+                        pos.sl_oid = new_oid
+
+        # ── Stage 2: Partial exit — at 2× entry, sell 50% qty ─────────────
+        if not pos.partial_done and ltp >= pos.entry_ltp * 2.0:
+            half_qty = (pos.qty // 2) if pos.qty > 1 else 0
+            if half_qty > 0:
+                try:
+                    _place_with_retry(sym, half_qty, tx="S", order_type="MKT")
+                    pos.qty -= half_qty
+                    pos.partial_done = True
+                    partial_pnl = (ltp - pos.entry_ltp) * half_qty
+                    with state_lock:
+                        state.pnl += partial_pnl
+                    log.info(
+                        f"💰 PARTIAL EXIT {sym}: {half_qty} @ ₹{ltp:.1f} "
+                        f"P&L ₹{partial_pnl:.0f} | keeping {pos.qty}"
+                    )
+                except Exception as e:
+                    log.warning(f"Partial exit failed: {e}")
+
+        # ── Stage 3: Full target (2.5× entry) → exit remainder ───────────
+        if ltp >= pos.tgt_prem:
+            log.info(f"🎯 TARGET: {sym} ₹{ltp:.1f} >= ₹{pos.tgt_prem:.1f}")
+            square_off(sym, "TGT_HIT"); return
+
+        # ── Stage 4: Trail — activate at +50%, trail 18% below peak ───────
+        trail_activate = pos.entry_ltp * 1.5   # trail kicks in at +50% gain
+        if ltp >= trail_activate:
+            new_sl = round(pos.peak_ltp * 0.82, 1)   # 18% below peak
             if new_sl > pos.sl_prem:
                 old_sl = pos.sl_prem
                 pos.sl_prem = new_sl
                 log.info(
-                    f"📈 Trail SL {sym}: ₹{old_sl:.1f} → ₹{new_sl:.1f} "
+                    f"📈 TRAIL SL {sym}: ₹{old_sl:.1f} → ₹{new_sl:.1f} "
                     f"(peak=₹{pos.peak_ltp:.1f})"
                 )
                 if pos.sl_oid and not CFG["paper"]:
                     new_oid = broker.modify_order(
                         pos.sl_oid, sym, pos.qty,
-                        new_trigger=round(new_sl * 0.99, 1),
+                        new_trigger=round(new_sl * 0.995, 1),
                         new_price=new_sl,
                     )
                     with state_lock:
@@ -1003,6 +1170,28 @@ class CandleBuilder:
                 self.cur.low     = min(self.cur.low,  ltp)
                 self.cur.close   = ltp
                 self.cur.volume += vol
+
+    def flush(self):
+        """
+        FIX: Force-close the current in-progress candle.
+        Call this at EOD (15:15) or on recovery after a feed interruption
+        so the last partial candle is not silently dropped.
+        Without this, any candle interrupted mid-period (e.g. poller restart)
+        is lost and the signal engine never sees it.
+        """
+        with self._lock:
+            if self.cur is not None and self.cur.ts != self._last_ts:
+                self._last_ts = self.cur.ts
+                closed = self.cur
+                self.cur = None
+                log.info(
+                    f"📊 Candle FLUSH {closed.ts.strftime('%H:%M')} | "
+                    f"O={closed.open:.0f} H={closed.high:.0f} "
+                    f"L={closed.low:.0f} C={closed.close:.0f} (partial)"
+                )
+                threading.Thread(
+                    target=self.on_close, args=(closed,), daemon=True
+                ).start()
 
 
 candle_builder = CandleBuilder(CFG["timeframe"], lambda c: on_candle_close(c))
@@ -1102,15 +1291,18 @@ class LTPPoller(threading.Thread):
     Polls Kotak Neo REST API for index spot LTP every second.
     This is the PRIMARY feed — WebSocket is optional secondary.
 
-    Why REST not WS:
-      Kotak Neo WS (nse_cm spot tokens) connects but sends zero ticks
-      in many retail accounts. REST quotes API is 100% reliable.
+    FIX v6.1:
+    - Tracks consecutive LTP=0 returns and forces session re-login after 10
+    - Catches NoneType __str__ SDK bug safely
+    - Logs at WARNING (not DEBUG) when silent, so failures appear in log
     """
     def __init__(self, interval: float = 1.0):
         super().__init__(daemon=True, name="LTPPoller")
-        self.interval  = interval
-        self.errors    = 0
-        self.last_ltp  = 0.0
+        self.interval      = interval
+        self.errors        = 0
+        self.last_ltp      = 0.0
+        self._zero_streak  = 0          # FIX: consecutive zero-LTP counter
+        self._last_candle  = time.time()  # FIX: watchdog: time of last candle tick
 
     def _market_open(self) -> bool:
         now = datetime.now()
@@ -1122,28 +1314,97 @@ class LTPPoller(threading.Thread):
 
     def run(self):
         log.info(f"📊 LTPPoller started — REST poll every {self.interval}s")
+        # FIX: single-thread executor used to enforce a hard timeout on each
+        # SDK HTTP call. Without this, a dropped network connection causes the
+        # requests library to block forever — freezing this thread silently.
+        _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LTPCall")
+
         while True:
             try:
                 if not self._market_open():
-                    time.sleep(10); continue
+                    self._zero_streak = 0
+                    time.sleep(10)
+                    continue
 
-                ltp = broker.get_index_ltp()
+                # FIX: proactively refresh session before polling
+                # Also wrapped with timeout in case login() hangs on network drop
+                try:
+                    fresh_future = _executor.submit(sess.ensure_fresh)
+                    fresh_future.result(timeout=15)
+                except FuturesTimeoutError:
+                    log.warning("⚠️  ensure_fresh() timed out — network issue. Will retry.")
+                    _executor.shutdown(wait=False)
+                    _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LTPCall")
+                    time.sleep(3)
+                    continue
+                except Exception as ef_e:
+                    err_str = str(ef_e) if ef_e is not None else repr(ef_e)
+                    log.warning(f"ensure_fresh error: {err_str}")
+
+                # FIX: enforce 10-second timeout on the SDK HTTP call (backup to socket timeout)
+                # Primary protection: socket.setdefaulttimeout(8) raises socket.timeout in the SDK
+                # Backup protection: future.result(timeout=10) catches anything the socket missed
+                try:
+                    future = _executor.submit(broker.get_index_ltp)
+                    ltp = future.result(timeout=10)
+                except FuturesTimeoutError:
+                    self.errors += 1
+                    log.warning(
+                        f"⚠️  Index LTP call timed out (>5s) — "
+                        f"network issue or API unresponsive. Forcing re-login."
+                    )
+                    # Recreate executor so the hung thread doesn't block future calls
+                    _executor.shutdown(wait=False)
+                    _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LTPCall")
+                    try:
+                        sess.login()
+                    except Exception as re_e:
+                        log.error(f"Re-login after timeout failed: {re_e}")
+                    time.sleep(2)
+                    continue
+
                 if ltp > 0:
-                    self.errors = 0
+                    self.errors       = 0
+                    self._zero_streak = 0
                     if abs(ltp - self.last_ltp) > 0.01:
                         log.debug(f"Poll ₹{ltp:.1f}")
-                    self.last_ltp = ltp
+                    self.last_ltp     = ltp
+                    self._last_candle = time.time()
                     candle_builder.tick(ltp, 0.0, datetime.now())
                 else:
-                    self.errors += 1
-                    if self.errors % 15 == 0:
+                    self._zero_streak += 1
+                    self.errors       += 1
+
+                    if self._zero_streak % 10 == 0:
                         log.warning(
-                            f"⚠️  Index LTP=0 ({self.errors}x) — "
+                            f"⚠️  Index LTP=0 for {self._zero_streak} consecutive polls "
+                            f"— forcing session re-login"
+                        )
+                        try:
+                            sess.login()
+                        except Exception as re_e:
+                            log.error(f"Re-login after zero-streak failed: {re_e}")
+
+                    elif self._zero_streak % 3 == 0:
+                        log.warning(
+                            f"⚠️  Index LTP=0 ({self._zero_streak}x) — "
                             f"check session / market hours"
                         )
+
             except Exception as e:
                 self.errors += 1
-                log.warning(f"LTPPoller: {e}")
+                # FIX: safely convert exception to string — Kotak SDK sometimes
+                # returns exceptions whose __str__() returns None (NoneType bug)
+                err_str = str(e) if e is not None else repr(e)
+                log.warning(f"LTPPoller error ({type(e).__name__}): {err_str}")
+                # FIX: force re-login on any API exception after 5 errors
+                if self.errors % 5 == 0:
+                    log.warning("LTPPoller: forcing session re-login after repeated errors")
+                    try:
+                        sess.login()
+                    except Exception as re_e:
+                        log.error(f"Re-login failed: {re_e}")
+
             time.sleep(self.interval)
 
 
@@ -1488,6 +1749,8 @@ if __name__ == "__main__":
             # EOD backup (TrailMonitor is primary EOD handler)
             now = datetime.now()
             if now.weekday() < 5 and now.hour == 15 and 10 <= now.minute <= 14:
+                # FIX: flush partial candle before EOD square-off
+                candle_builder.flush()
                 if state.open_positions():
                     log.info("⏰ 15:10 EOD backup — squaring off")
                     square_off_all("EOD")

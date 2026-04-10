@@ -72,10 +72,10 @@ CFG = {
     "mpin":            os.getenv("KOTAK_MPIN",            ""),
     "totp_secret":     os.getenv("KOTAK_TOTP_SECRET",     ""),
     "environment":     os.getenv("ENVIRONMENT",    "prod"),
-    "paper_trade":     os.getenv("PAPER_TRADE",    "true").lower() == "true",
+    "paper_trade":     os.getenv("PAPER_TRADE",    "false").lower() == "true",
     "webhook_secret":  os.getenv("WEBHOOK_SECRET", "MY_API_KEY_TAG"),
     "port":            int(os.getenv("PORT",        "5000")),
-    "max_capital":     float(os.getenv("MAX_CAPITAL",    "20000")),
+    "max_capital":     float(os.getenv("MAX_CAPITAL",    "50000")),
     "max_daily_loss":  float(os.getenv("MAX_DAILY_LOSS", "3")),    # %
     "max_trades":      int(os.getenv("MAX_TRADES",       "3")),
     # Maximum option premium to buy per lot (protect capital on 20k)
@@ -1022,4 +1022,4 @@ if __name__ == "__main__":
         log.warning("[WARN] Credentials not configured -- set .env")
 
     TrailMonitor(check_interval=5).start()
-    app.run(host="0.0.0.0", port=CFG["port"], debug=False)
+    app.run(host="0.0.0.0", port=CFG["port"], debug=True)
