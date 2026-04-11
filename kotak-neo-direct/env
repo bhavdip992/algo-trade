@@ -96,3 +96,4 @@ TGT_ATR_MULT=2.5            # base; boosted to 3.5 on score≥8 signals
 USE_TRAIL=true
 TRAIL_TRIG=0.8              # activate trail after 1×ATR profit
 TRAIL_STEP=0.4              # trail SL at 0.4×ATR below peak
+BRIDGE_URL=http://localhost:5000

@@ -1,0 +1,20 @@
+[Unit]
+Description=Kotak Neo Options Auto-Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/algo-trade/algo-trade/kotak-neo-direct
+ExecStart=/home/ubuntu/algo-trade/venv/bin/python /home/ubuntu/algo-trade/algo-trade/kotak-neo-direct/kotak_live.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kotak-live
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

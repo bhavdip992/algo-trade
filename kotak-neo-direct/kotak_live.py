@@ -35,7 +35,7 @@ from datetime import datetime, date, timedelta
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
 # ════════════════════════════════════════════════════════════════════════
 # CLI ARGS
@@ -113,12 +113,12 @@ CFG = {
     "environment":    _s("ENVIRONMENT", "prod"),
     "paper":          PAPER,
 
-    "index":          _s("INDEX", "BANKNIFTY").upper(),
+    "index":          _s("INDEX", "NIFTY").upper(),
     "lot_size":       _i("LOT_SIZE",    30),
     "strike_step":    _i("STRIKE_STEP", 100),
-    "expiry_weekday": _s("EXPIRY_WEEKDAY", "WED").upper(),
+    "expiry_weekday": _s("EXPIRY_WEEKDAY", "TUE").upper(),
     "expiry_type":    _s("EXPIRY_TYPE",  "Weekly"),
-    "strike_mode":    _s("STRIKE_MODE",  "ATM"),
+    "strike_mode":    _s("STRIKE_MODE",  "OTM1"),
     "option_type":    _s("OPTION_TYPE",  "AUTO"),   # AUTO | CE Only | PE Only
     "timeframe":      _i("TIMEFRAME",    5),
 
@@ -218,6 +218,7 @@ class KotakSession:
         # FIX: _lock is NOT held inside login body to avoid deadlock when
         # ensure_fresh() → login() is called from multiple threads simultaneously.
         # The outer ensure_fresh() call is already serialised by the lock.
+        print("🔑 Logging into Kotak Neo...", CFG)
         log.info("🔑 Logging into Kotak Neo...")
         client = NeoAPI(
             consumer_key=CFG["consumer_key"],
