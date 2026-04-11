@@ -85,6 +85,13 @@ log.info("🔒 Global socket timeout set to 8s (prevents thread hang on network 
 
 from signal_engine import SignalEngine, EngineConfig, SignalResult
 
+# NOTE: imported AFTER load_dotenv so env vars are available
+from telegram_notify import (
+    notify_startup, notify_trade_open, notify_trade_exit,
+    notify_sl_trail, notify_daily_summary, notify_error,
+    notify_halted, TelegramCommandListener,
+)
+
 
 # ════════════════════════════════════════════════════════════════════════
 # ENV HELPERS
@@ -822,6 +829,10 @@ def square_off(symbol: str, reason: str = "MANUAL") -> dict:
             f"| Entry ₹{pos.entry_ltp:.1f} → Exit ₹{ltp:.1f} "
             f"| P&L ₹{pnl:.0f}"
         )
+        notify_trade_exit(
+            symbol=symbol, reason=reason, entry_ltp=pos.entry_ltp,
+            exit_ltp=ltp, pnl=pnl, qty=pos.qty,
+        )
         return {"symbol": symbol, "status": reason, "pnl": round(pnl, 2), "oid": oid}
     except Exception as e:
         log.error(f"square_off failed ({symbol}): {e}")
@@ -986,6 +997,12 @@ def execute_trade(result: SignalResult) -> bool:
         f"{lots}L @ ₹{opt_ltp:.1f} | "
         f"Cost ₹{cost:.0f} | SL ₹{sl_prem:.1f} | Tgt ₹{tgt_prem:.1f}"
     )
+    notify_trade_open(
+        symbol=symbol, option=option, entry_ltp=opt_ltp,
+        sl_prem=sl_prem, tgt_prem=tgt_prem, qty=qty, lots=lots,
+        cost=cost, spot=result.close, confirmations=result.confirmations,
+        reason=result.signal_reason, mode=mode,
+    )
     return True
 
 
@@ -1116,6 +1133,7 @@ class TrailMonitor(threading.Thread):
                     )
                     with state_lock:
                         pos.sl_oid = new_oid
+                notify_sl_trail(sym, old_sl, new_sl, pos.peak_ltp)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1692,6 +1710,7 @@ if __name__ == "__main__":
 
     # 1. Login
     sess.login()
+    notify_startup(CFG)
 
     # 1b. Find correct index instrument token via scrip master
     log.info(f"🔍 Finding {CFG['index']} instrument token...")
@@ -1725,6 +1744,12 @@ if __name__ == "__main__":
 
     # 4. TrailMonitor
     TrailMonitor(interval=5).start()
+
+    # Telegram command listener
+    TelegramCommandListener(
+        get_state_fn=lambda: state,
+        square_off_all_fn=square_off_all,
+    ).start()
 
     # 5. REST LTP Poller (PRIMARY)
     LTPPoller(interval=1.0).start()
@@ -1760,6 +1785,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log.info("\nCtrl+C — squaring off all...")
         square_off_all("MANUAL")
+        notify_daily_summary(state.trades, state.pnl, state.candles)
         print()
         print(f"  ── Session Summary ──────────────────────")
         print(f"  Trades   : {state.trades}")
