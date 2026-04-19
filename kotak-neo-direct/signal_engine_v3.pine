@@ -1,0 +1,316 @@
+// ════════════════════════════════════════════════════════════════════════
+// Signal Engine v3.0 — ORB + VWAP + EMA (Pine Script v5)
+// Mirrors signal_engine.py exactly:
+//   Mandatory: ORB breakout + VWAP side + EMA stack (3/3 required)
+//   Confirmations: RSI + ADX + Supertrend + Body/NoBBsqueeze (need ≥2/4)
+//   Time gate: 09:30–14:45 IST  |  ORB forms 09:15–09:30
+//
+// USAGE:
+//   Add to NIFTY / BANKNIFTY 5-min chart on TradingView
+//   Signals appear as BUY CE (bullish) or BUY PE (bearish) labels
+//   SL and target lines drawn on each signal
+// ════════════════════════════════════════════════════════════════════════
+//@version=5
+indicator(title="Signal Engine v3 — ORB+VWAP+EMA", shorttitle="SigEng v3",
+          overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ── Inputs ────────────────────────────────────────────────────────────
+grp_ema   = "EMA Settings"
+ema_fast  = input.int(9,   "Fast EMA",   group=grp_ema)
+ema_mid   = input.int(21,  "Mid EMA",    group=grp_ema)
+ema_slow  = input.int(50,  "Slow EMA",   group=grp_ema)
+ema_trend = input.int(200, "Trend EMA",  group=grp_ema)
+
+grp_st    = "Supertrend"
+st_len    = input.int(10,  "ATR Length", group=grp_st)
+st_factor = input.float(2.5, "Factor",   group=grp_st, step=0.1)
+
+grp_rsi   = "RSI"
+rsi_len   = input.int(14,  "Length",     group=grp_rsi)
+rsi_ob    = input.int(65,  "Overbought", group=grp_rsi)
+rsi_os    = input.int(32,  "Oversold",   group=grp_rsi)
+
+grp_adx   = "ADX"
+adx_len   = input.int(14,  "Length",     group=grp_adx)
+adx_thr   = input.int(22,  "Threshold",  group=grp_adx)
+
+grp_bb    = "Bollinger Bands"
+bb_len    = input.int(20,  "Length",     group=grp_bb)
+bb_std    = input.float(2.0, "StdDev",   group=grp_bb, step=0.1)
+vol_mult  = input.float(1.2, "Volume Multiplier (squeeze filter)", group=grp_bb)
+
+grp_sig   = "Signal Gate"
+min_conf  = input.int(5,   "Min confirmations (out of 8)",         group=grp_sig,
+            tooltip="Python engine uses 3 mandatory + 2 of 4 confirmations = 5 total")
+opt_type  = input.string("AUTO", "Option Type",
+            options=["AUTO","CE Only","PE Only"], group=grp_sig)
+
+grp_sl    = "SL / Target"
+sl_atr    = input.float(1.2, "SL ATR multiplier", group=grp_sl, step=0.1)
+tgt_atr   = input.float(2.5, "Target ATR multiplier", group=grp_sl, step=0.1)
+show_lines= input.bool(true, "Draw SL/Target lines", group=grp_sl)
+
+grp_orb   = "Opening Range Breakout"
+orb_bars  = input.int(3, "ORB bars (3 × 5min = 9:15–9:30)", group=grp_orb,
+            tooltip="Number of opening bars to form the range")
+show_orb  = input.bool(true, "Show ORB levels", group=grp_orb)
+
+grp_time  = "Time Filter (IST = UTC+5:30)"
+trade_start_h = input.int(9,  "Start hour (IST)",   group=grp_time)
+trade_start_m = input.int(30, "Start minute (IST)", group=grp_time)
+trade_end_h   = input.int(14, "End hour (IST)",     group=grp_time)
+trade_end_m   = input.int(45, "End minute (IST)",   group=grp_time)
+
+// ── Time helpers (IST = UTC + 330 minutes) ───────────────────────────
+ist_hour  = hour(time, "Asia/Kolkata")
+ist_min   = minute(time, "Asia/Kolkata")
+bar_min   = ist_hour * 60 + ist_min
+
+in_time   = (bar_min >= trade_start_h * 60 + trade_start_m) and (bar_min <= trade_end_h * 60 + trade_end_m)
+
+// same trading day check
+is_new_day = ta.change(dayofmonth(time, "Asia/Kolkata")) != 0
+
+// ── EMAs ─────────────────────────────────────────────────────────────
+ef  = ta.ema(close, ema_fast)
+em  = ta.ema(close, ema_mid)
+es  = ta.ema(close, ema_slow)
+et  = ta.ema(close, ema_trend)
+
+plot(ef, "EMA Fast",  color=color.new(color.teal,  20), linewidth=1)
+plot(em, "EMA Mid",   color=color.new(color.orange, 20), linewidth=1)
+plot(es, "EMA Slow",  color=color.new(color.red,   30), linewidth=1)
+plot(et, "EMA Trend", color=color.new(color.gray,  40), linewidth=2)
+
+// EMA conditions
+ema_bull     = ef > em and em > es
+ema_bear     = ef < em and em < es
+ema_cross_up = ef[1] < em[1] and ef >= em
+ema_cross_dn = ef[1] > em[1] and ef <= em
+bull_trend   = (close > et and ef > es) or ema_cross_up
+bear_trend   = (close < et and ef < es) or ema_cross_dn
+
+// ── ATR ───────────────────────────────────────────────────────────────
+atr = ta.atr(adx_len)
+
+// ── Supertrend ────────────────────────────────────────────────────────
+[st_line, st_dir] = ta.supertrend(st_factor, st_len)
+// st_dir: -1 = bullish (price above), +1 = bearish (price below)
+st_bull = st_dir == -1
+st_bear = st_dir ==  1
+
+// ── RSI ───────────────────────────────────────────────────────────────
+rsi     = ta.rsi(close, rsi_len)
+rsi_buy = rsi > 45 and rsi < rsi_ob
+rsi_sell= rsi > rsi_os and rsi < 55
+
+// ── ADX ───────────────────────────────────────────────────────────────
+[diplus, diminus, adx_val] = ta.dmi(adx_len, adx_len)
+trending = adx_val > adx_thr
+
+// ── Bollinger Bands + squeeze ─────────────────────────────────────────
+[bb_mid, bb_upper, bb_lower] = ta.bb(close, bb_len, bb_std)
+bw           = (bb_upper - bb_lower) / bb_mid
+bw_sma       = ta.sma(bw, bb_len)
+bb_squeeze   = bw < bw_sma * 0.60
+no_squeeze   = not bb_squeeze
+
+// ── Volume spike ──────────────────────────────────────────────────────
+vol_avg   = ta.sma(volume, 20)
+vol_spike = volume > vol_avg * vol_mult
+
+// ── Candle body filter ────────────────────────────────────────────────
+candle_body = math.abs(close - open)
+body_ok     = candle_body >= atr * 0.25
+
+// ── VWAP ──────────────────────────────────────────────────────────────
+vwap_val  = ta.vwap(hlc3)
+vwap_bull = close > vwap_val
+vwap_bear = close < vwap_val
+
+plot(vwap_val, "VWAP", color=color.new(color.blue, 30), linewidth=1, style=plot.style_line)
+
+// ── Opening Range Breakout (ORB) ──────────────────────────────────────
+// Detect ORB: first orb_bars candles of each trading day starting at 9:15 IST
+var float orb_high = na
+var float orb_low  = na
+var bool  orb_formed = false
+var int   orb_bar_count = 0
+var int   orb_day = na
+
+// Reset on new day
+if is_new_day or na(orb_day)
+    orb_high      := na
+    orb_low        := na
+    orb_formed    := false
+    orb_bar_count := 0
+    orb_day       := dayofmonth(time, "Asia/Kolkata")
+
+// Accumulate ORB bars (9:15 to 9:30 IST = first 3 five-min bars)
+orb_start = ist_hour == 9 and ist_min >= 15
+if orb_start and not orb_formed
+    orb_bar_count := orb_bar_count + 1
+    orb_high      := na(orb_high) ? high : math.max(orb_high, high)
+    orb_low       := na(orb_low)  ? low  : math.min(orb_low,  low)
+    if orb_bar_count >= orb_bars
+        orb_formed := true
+
+// ORB breakout
+orb_bull = orb_formed and close > orb_high
+orb_bear = orb_formed and close < orb_low
+
+// Draw ORB levels
+var line orb_high_line = na
+var line orb_low_line  = na
+
+if orb_formed and show_orb and barstate.isconfirmed
+    if na(orb_high_line) or ta.change(dayofmonth(time, "Asia/Kolkata")) != 0
+        orb_high_line := line.new(bar_index, orb_high, bar_index + 75,
+                         orb_high, color=color.new(color.green, 40),
+                         style=line.style_dashed, width=1)
+        orb_low_line  := line.new(bar_index, orb_low,  bar_index + 75,
+                         orb_low,  color=color.new(color.red,   40),
+                         style=line.style_dashed, width=1)
+
+// ── Signal Logic ──────────────────────────────────────────────────────
+// Exactly mirrors Python _evaluate():
+//   BUY_CE mandatory : orb_bull AND vwap_bull AND ema_bull
+//   BUY_PE mandatory : orb_bear AND vwap_bear AND ema_bear
+//   Confirmation need ≥ (min_conf - 3) of [RSI, ADX, ST, body+noSqueeze]
+
+need_conf = math.max(1, min_conf - 3)
+
+// CE confirmations
+ce_conf1 = rsi_buy    ? 1 : 0
+ce_conf2 = trending   ? 1 : 0
+ce_conf3 = st_bull    ? 1 : 0
+ce_conf4 = (body_ok and no_squeeze) ? 1 : 0
+ce_conf_cnt = ce_conf1 + ce_conf2 + ce_conf3 + ce_conf4
+
+// PE confirmations
+pe_conf1 = rsi_sell   ? 1 : 0
+pe_conf2 = trending   ? 1 : 0
+pe_conf3 = st_bear    ? 1 : 0
+pe_conf4 = (body_ok and no_squeeze) ? 1 : 0
+pe_conf_cnt = pe_conf1 + pe_conf2 + pe_conf3 + pe_conf4
+
+// Mandatory gates
+ce_mandatory = orb_bull and vwap_bull and ema_bull
+pe_mandatory = orb_bear and vwap_bear and ema_bear
+
+// Raw signal
+buy_ce_raw = ce_mandatory and (ce_conf_cnt >= need_conf) and opt_type != "PE Only" and in_time
+
+buy_pe_raw = pe_mandatory and (pe_conf_cnt >= need_conf) and opt_type != "CE Only" and in_time
+
+// Tie-break: prefer stronger side
+buy_ce = buy_ce_raw and (not buy_pe_raw or ce_conf_cnt >= pe_conf_cnt)
+buy_pe = buy_pe_raw and (not buy_ce_raw or pe_conf_cnt >  ce_conf_cnt)
+
+// Cooldown — suppress repeat for 3 bars (mirrors Python _bars_since_signal)
+var int bars_since = 99
+bars_since := bars_since + 1
+signal_fired = buy_ce or buy_pe
+if signal_fired and bars_since >= 3
+    bars_since := 0
+else if signal_fired and bars_since < 3
+    buy_ce := false
+    buy_pe := false
+
+// ── Total confirmation count (for label) ──────────────────────────────
+// = 3 mandatory (ORB+VWAP+EMA) + confirmations fired
+ce_total = buy_ce ? 3 + ce_conf_cnt : 0
+pe_total = buy_pe ? 3 + pe_conf_cnt : 0
+
+// ── SL / Target ───────────────────────────────────────────────────────
+swing_lo = ta.lowest(low,  10)
+swing_hi = ta.highest(high, 10)
+
+ce_sl  = close - atr * sl_atr
+ce_tgt = close + atr * tgt_atr
+pe_sl  = close + atr * sl_atr
+pe_tgt = close - atr * tgt_atr
+
+// ── Labels ────────────────────────────────────────────────────────────
+if buy_ce and barstate.isconfirmed
+    label.new(bar_index, low - atr * 0.5,
+              "BUY CE\n" + str.tostring(close, "#.0") +
+              "\nConf: " + str.tostring(ce_total) + "/8" +
+              "\nSL: "   + str.tostring(ce_sl,  "#.0") +
+              "\nTgt: "  + str.tostring(ce_tgt, "#.0"),
+              style=label.style_label_up,
+              color=color.new(color.teal, 10),
+              textcolor=color.white, size=size.small)
+    if show_lines
+        line.new(bar_index, ce_sl,  bar_index + 20, ce_sl,
+                 color=color.new(color.red,   20), style=line.style_dashed, width=1)
+        line.new(bar_index, ce_tgt, bar_index + 20, ce_tgt,
+                 color=color.new(color.green, 20), style=line.style_dashed, width=1)
+
+if buy_pe and barstate.isconfirmed
+    label.new(bar_index, high + atr * 0.5,
+              "BUY PE\n" + str.tostring(close, "#.0") +
+              "\nConf: " + str.tostring(pe_total) + "/8" +
+              "\nSL: "   + str.tostring(pe_sl,  "#.0") +
+              "\nTgt: "  + str.tostring(pe_tgt, "#.0"),
+              style=label.style_label_down,
+              color=color.new(color.red, 10),
+              textcolor=color.white, size=size.small)
+    if show_lines
+        line.new(bar_index, pe_sl,  bar_index + 20, pe_sl,
+                 color=color.new(color.red,   20), style=line.style_dashed, width=1)
+        line.new(bar_index, pe_tgt, bar_index + 20, pe_tgt,
+                 color=color.new(color.green, 20), style=line.style_dashed, width=1)
+
+// ── Background: ORB zone ──────────────────────────────────────────────
+// Shade the ORB formation window (9:15–9:30) light gray
+orb_window = ist_hour == 9 and ist_min >= 15 and ist_min < 30
+bgcolor(orb_window ? color.new(color.gray, 90) : na, title="ORB window")
+
+// ── Alert conditions ──────────────────────────────────────────────────
+alertcondition(buy_ce, title="BUY CE Signal",
+               message="BUY CE | {{ticker}} | Close={{close}} | Conf={{plot_0}}")
+alertcondition(buy_pe, title="BUY PE Signal",
+               message="BUY PE | {{ticker}} | Close={{close}}")
+
+// ── Dashboard table ───────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 10,
+                 bgcolor=color.new(color.black, 85), border_width=1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "INDICATOR",  text_color=color.gray,  text_size=size.tiny)
+    table.cell(dash, 1, 0, "VALUE",      text_color=color.gray,  text_size=size.tiny)
+    table.cell(dash, 0, 1, "EMA Stack",  text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 1, ema_bull ? "BULL" : ema_bear ? "BEAR" : "MIXED",
+               text_color=ema_bull ? color.teal : ema_bear ? color.red : color.gray,
+               text_size=size.tiny)
+    table.cell(dash, 0, 2, "VWAP",       text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 2, vwap_bull ? "Above" : "Below",
+               text_color=vwap_bull ? color.teal : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 3, "SuperTrend", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 3, st_bull ? "BULL" : "BEAR",
+               text_color=st_bull ? color.teal : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 4, "RSI",        text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 4, str.tostring(math.round(rsi, 1)),
+               text_color=rsi > rsi_ob ? color.red : rsi < rsi_os ? color.green
+                                        : color.white, text_size=size.tiny)
+    table.cell(dash, 0, 5, "ADX",        text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 5, str.tostring(math.round(adx_val, 1)) + (trending ? " [OK]" : " [LOW]"),
+               text_color=trending ? color.teal : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 6, "ORB",        text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 6, orb_formed ?
+               str.tostring(math.round(orb_low, 0)) + " – " +
+               str.tostring(math.round(orb_high, 0)) : "forming",
+               text_color=orb_formed ? color.white : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 7, "Squeeze",    text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 7, bb_squeeze ? "YES" : "No",
+               text_color=bb_squeeze ? color.orange : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 8, "Signal",     text_color=color.white, text_size=size.small)
+    signal_txt = buy_ce ? "BUY CE" : buy_pe ? "BUY PE" : "NONE"
+    signal_col = buy_ce ? color.teal : buy_pe ? color.red : color.gray
+    table.cell(dash, 1, 8, signal_txt, text_color=signal_col, text_size=size.small)
+    table.cell(dash, 0, 9, "Confs",      text_color=color.white, text_size=size.tiny)
+    conf_now = buy_ce ? ce_total : buy_pe ? pe_total : (3 + math.max(ce_conf_cnt, pe_conf_cnt))
+    table.cell(dash, 1, 9, str.tostring(conf_now) + "/8",
+               text_color=conf_now >= min_conf ? color.teal : color.gray,
+               text_size=size.tiny)
