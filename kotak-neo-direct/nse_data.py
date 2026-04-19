@@ -2,22 +2,21 @@
 nse_data.py
 ═══════════
 Real NSE historical data fetcher for BANKNIFTY / NIFTY backtesting.
-100% free — no paid subscription, no broker login needed.
 
-Supports 4 data sources (tried in order):
-  1. OpenChart  — 5-min intraday NFO futures data (best for options backtesting)
-  2. nsepy      — Daily OHLCV index data (pip install nsepy)
-  3. nselib     — Daily index data (pip install nselib)
-  4. NSE REST   — Direct NSE website scraping (no install needed)
+Data sources (tried in order):
+  0. Dhan API    — real 5-min intraday (BEST — set DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN in .env)
+  1. OpenChart   — 5-min intraday NFO futures data
+  2. nsepy       — Daily OHLCV index data
+  3. nselib      — Daily index data
+  4. NSE REST    — Direct NSE website scraping
 
 Usage:
-  py -3.11 nse_data.py                         # fetch BANKNIFTY 90 days
-  py -3.11 nse_data.py --index NIFTY --days 60
-  py -3.11 nse_data.py --source openchart
-  py -3.11 nse_data.py --save                  # save to CSV for reuse
+  py -3.11 nse_data.py --index NIFTY --days 90 --save
+  py -3.11 nse_data.py --source dhan --index NIFTY --days 30 --save
+  py -3.11 nse_data.py --check
 
-Install all sources:
-  py -3.11 -m pip install nsepy nselib openchart-python requests pandas
+Install:
+  py -3.11 -m pip install nsepy nselib openchart-python requests pandas python-dotenv
 """
 
 import os, sys, json, time, logging, argparse
@@ -39,33 +38,131 @@ NSE_INDEX_MAP = {
     "MIDCPNIFTY": "NIFTY MID SELECT",
 }
 
-# OpenChart futures symbols for intraday data
 OPENCHART_FUTURES = {
     "BANKNIFTY": "BANKNIFTY",
     "NIFTY":     "NIFTY",
     "FINNIFTY":  "FINNIFTY",
 }
 
+
 # ═════════════════════════════════════════════════════════════
-# SOURCE 1: OpenChart (5-min intraday — best for options BT)
+# SOURCE 0: Dhan API — real 5-min intraday (BEST)
+# ═════════════════════════════════════════════════════════════
+def fetch_dhan(index: str, tf_min: int, days: int) -> pd.DataFrame:
+    """
+    Dhan intraday API — real 5-min OHLCV for NSE indices.
+    Requires DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env
+    POST https://api.dhan.co/v2/charts/intraday
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    except Exception:
+        pass
+
+    client_id    = os.getenv("DHAN_CLIENT_ID", "").strip()
+    access_token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
+
+    if not client_id or not access_token:
+        log.info("Dhan: DHAN_CLIENT_ID/DHAN_ACCESS_TOKEN not set — skipping")
+        return pd.DataFrame()
+
+    DHAN_SECURITY_ID = {
+        "NIFTY": "13", "BANKNIFTY": "25",
+        "FINNIFTY": "27", "MIDCPNIFTY": "442",
+    }
+    DHAN_INTERVAL = {1:"1", 3:"3", 5:"5", 10:"10", 15:"15", 25:"25", 60:"60"}
+
+    security_id = DHAN_SECURITY_ID.get(index.upper())
+    if not security_id:
+        log.warning(f"Dhan: no security ID for {index}")
+        return pd.DataFrame()
+
+    interval = DHAN_INTERVAL.get(tf_min, "5")
+    now      = datetime.now()
+    from_dt  = now - timedelta(days=days)
+
+    payload = {
+        "securityId":      security_id,
+        "exchangeSegment": "IDX_I",
+        "instrument":      "INDEX",
+        "interval":        interval,
+        "fromDate":        from_dt.strftime("%Y-%m-%d"),
+        "toDate":          now.strftime("%Y-%m-%d"),
+    }
+    headers = {
+        "access-token": access_token,
+        "client-id":    client_id,
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+    }
+
+    log.info(f"Dhan: {index} {tf_min}min {payload['fromDate']} → {payload['toDate']}")
+    try:
+        resp = requests.post(
+            "https://api.dhan.co/v2/charts/intraday",
+            headers=headers, json=payload, timeout=15,
+        )
+        if resp.status_code != 200:
+            log.warning(f"Dhan API {resp.status_code}: {resp.text[:200]}")
+            return pd.DataFrame()
+
+        data       = resp.json()
+        opens      = data.get("open",      [])
+        highs      = data.get("high",      [])
+        lows       = data.get("low",       [])
+        closes     = data.get("close",     [])
+        volumes    = data.get("volume",    [])
+        timestamps = data.get("timestamp", data.get("start_Time", []))
+
+        if not closes:
+            log.warning(f"Dhan returned empty data: {str(data)[:200]}")
+            return pd.DataFrame()
+
+        rows = []
+        for i in range(len(closes)):
+            try:
+                cl = float(closes[i])
+                if cl <= 0: continue
+                o  = float(opens[i])   if i < len(opens)   else cl
+                h  = float(highs[i])   if i < len(highs)   else cl
+                l  = float(lows[i])    if i < len(lows)    else cl
+                v  = float(volumes[i]) if i < len(volumes) else 0.0
+                ts = timestamps[i]     if i < len(timestamps) else None
+                rows.append({"timestamp": ts, "open": o, "high": h,
+                             "low": l, "close": cl, "volume": v})
+            except Exception:
+                continue
+
+        df = pd.DataFrame(rows)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = df.set_index("timestamp").sort_index()
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df = df.between_time("09:15", "15:30")
+        df = df[df.index.dayofweek < 5]
+        log.info(f"Dhan: loaded {len(df)} candles "
+                 f"({df.index[0].date()} → {df.index[-1].date()})")
+        return df
+
+    except Exception as e:
+        log.warning(f"Dhan request failed: {e}")
+        return pd.DataFrame()
+
+
+# ═════════════════════════════════════════════════════════════
+# SOURCE 1: OpenChart (5-min intraday)
 # ═════════════════════════════════════════════════════════════
 def fetch_openchart(index: str, tf_min: int, days: int) -> pd.DataFrame:
-    """
-    OpenChart: free NSE/NFO intraday data library.
-    Gives 5-min, 15-min candles for index futures.
-    Install: py -3.11 -m pip install openchart
-
-    Returns OHLCV DataFrame with DatetimeIndex.
-    """
     try:
         from openchart import NSEData
         nse = NSEData()
-        nse.download()   # downloads master contract (cached after first run)
+        nse.download()
 
         end_dt   = datetime.now()
         start_dt = end_dt - timedelta(days=days + 10)
 
-        # Search for the continuous futures symbol
         sym_map = {
             "BANKNIFTY": "NIFTY BANK",
             "NIFTY":     "NIFTY 50",
@@ -75,11 +172,8 @@ def fetch_openchart(index: str, tf_min: int, days: int) -> pd.DataFrame:
 
         log.info(f"OpenChart: fetching {symbol} {tf_min}m data...")
         df = nse.historical(
-            symbol=symbol,
-            exchange="NSE",
-            start=start_dt,
-            end=end_dt,
-            interval=f"{tf_min}m",
+            symbol=symbol, exchange="NSE",
+            start=start_dt, end=end_dt, interval=f"{tf_min}m",
         )
 
         if df is not None and not df.empty:
@@ -88,9 +182,8 @@ def fetch_openchart(index: str, tf_min: int, days: int) -> pd.DataFrame:
             if "volume" not in df.columns:
                 df["volume"] = 1000000
             df = df[["open","high","low","close","volume"]].astype(float)
-            # Filter to IST market hours 9:15–15:30
             df = df.between_time("09:15", "15:30")
-            df = df[df.index.dayofweek < 5]  # remove weekends
+            df = df[df.index.dayofweek < 5]
             log.info(f"OpenChart: loaded {len(df)} {tf_min}-min candles")
             return df
 
@@ -106,13 +199,6 @@ def fetch_openchart(index: str, tf_min: int, days: int) -> pd.DataFrame:
 # SOURCE 2: nsepy — daily index OHLCV
 # ═════════════════════════════════════════════════════════════
 def fetch_nsepy(index: str, days: int) -> pd.DataFrame:
-    """
-    nsepy: get_history() for index daily OHLCV.
-    Install: py -3.11 -m pip install nsepy
-
-    Note: NSE changed their API in 2023. If nsepy fails,
-    try: py -3.11 -m pip install git+https://github.com/gvkool/nsepy
-    """
     try:
         from nsepy import get_history
 
@@ -160,10 +246,6 @@ def fetch_nsepy(index: str, days: int) -> pd.DataFrame:
 # SOURCE 3: nselib — daily index OHLCV
 # ═════════════════════════════════════════════════════════════
 def fetch_nselib(index: str, days: int) -> pd.DataFrame:
-    """
-    nselib: capital_market.index_data()
-    Install: py -3.11 -m pip install nselib
-    """
     try:
         from nselib import capital_market
 
@@ -180,7 +262,6 @@ def fetch_nselib(index: str, days: int) -> pd.DataFrame:
 
         log.info(f"nselib: fetching {symbol} daily data...")
 
-        # nselib only allows ~2 year chunks
         all_chunks = []
         chunk_start = start_dt
         while chunk_start < end_dt:
@@ -203,14 +284,12 @@ def fetch_nselib(index: str, days: int) -> pd.DataFrame:
         df = pd.concat(all_chunks)
         df.columns = [c.lower().strip() for c in df.columns]
 
-        # Find timestamp column
         for col in ["timestamp", "date", "eod_timestamp"]:
             if col in df.columns:
                 df.index = pd.to_datetime(df[col], dayfirst=True)
                 break
         df.index.name = "timestamp"
 
-        # Map columns
         col_map = {}
         for col in df.columns:
             cl = col.lower()
@@ -222,9 +301,7 @@ def fetch_nselib(index: str, days: int) -> pd.DataFrame:
 
         for c in ["open","high","low","close"]:
             if c in df.columns:
-                df[c] = pd.to_numeric(
-                    df[c].astype(str).str.replace(",",""), errors="coerce"
-                )
+                df[c] = pd.to_numeric(df[c].astype(str).str.replace(",",""), errors="coerce")
         if "volume" not in df.columns:
             df["volume"] = 1000000
 
@@ -242,13 +319,9 @@ def fetch_nselib(index: str, days: int) -> pd.DataFrame:
 
 
 # ═════════════════════════════════════════════════════════════
-# SOURCE 4: NSE direct REST API (no install, just requests)
+# SOURCE 4: NSE direct REST API
 # ═════════════════════════════════════════════════════════════
 def fetch_nse_rest(index: str, days: int) -> pd.DataFrame:
-    """
-    NSE public REST API — no login, no install beyond requests.
-    Fetches daily OHLCV in 50-day chunks (NSE limit per request).
-    """
     sym_map = {
         "BANKNIFTY":  "NIFTY BANK",
         "NIFTY":      "NIFTY 50",
@@ -268,7 +341,6 @@ def fetch_nse_rest(index: str, days: int) -> pd.DataFrame:
         "Connection": "keep-alive",
     })
 
-    # Hit homepage first to get cookies
     try:
         log.info("NSE REST: getting session cookies...")
         session.get("https://www.nseindia.com", timeout=10)
@@ -282,7 +354,6 @@ def fetch_nse_rest(index: str, days: int) -> pd.DataFrame:
     end_dt   = date.today()
     start_dt = end_dt - timedelta(days=days + 10)
 
-    # NSE allows max ~50 days per request — chunk it
     chunk_days = 45
     cur_end = end_dt
     while cur_end > start_dt:
@@ -306,7 +377,7 @@ def fetch_nse_rest(index: str, days: int) -> pd.DataFrame:
                         "high":  float(str(item.get("EOD_HIGH_INDEX_VAL",  0)).replace(",","")),
                         "low":   float(str(item.get("EOD_LOW_INDEX_VAL",   0)).replace(",","")),
                         "close": float(str(item.get("EOD_CLOSE_INDEX_VAL", 0)).replace(",","")),
-                        "volume": float(str(item.get("EOD_TRADED_QTY",    1000000)).replace(",","")),
+                        "volume": float(str(item.get("EOD_TRADED_QTY", 1000000)).replace(",","")),
                     })
                 except Exception:
                     pass
@@ -315,7 +386,7 @@ def fetch_nse_rest(index: str, days: int) -> pd.DataFrame:
             log.warning(f"  NSE REST chunk failed {cur_start}–{cur_end}: {e}")
 
         cur_end = cur_start - timedelta(days=1)
-        time.sleep(0.5)  # be polite to NSE servers
+        time.sleep(0.5)
 
     if not all_rows:
         log.warning("NSE REST: no data returned")
@@ -329,18 +400,10 @@ def fetch_nse_rest(index: str, days: int) -> pd.DataFrame:
 
 
 # ═════════════════════════════════════════════════════════════
-# RESAMPLE DAILY → INTRADAY (for testing when no intraday data)
+# RESAMPLE DAILY → INTRADAY
 # ═════════════════════════════════════════════════════════════
 def resample_daily_to_intraday(df_daily: pd.DataFrame, tf_min: int) -> pd.DataFrame:
-    """
-    Simulate intraday candles from daily OHLCV data.
-    Each daily bar is split into N intraday bars (9:15–15:30)
-    using realistic intraday price paths.
-
-    NOTE: This is for strategy testing only — not real intraday data.
-    For real 5-min data use openchart or your broker CSV.
-    """
-    bars_per_day = int(375 / tf_min)   # 375 min in trading session
+    bars_per_day = int(375 / tf_min)
     rows = []
     np.random.seed(42)
 
@@ -349,23 +412,18 @@ def resample_daily_to_intraday(df_daily: pd.DataFrame, tf_min: int) -> pd.DataFr
         o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
         daily_vol   = float(row.get("volume", 1000000))
 
-        # Generate realistic intraday price path using GBM
-        # Pin open to daily open, close to daily close
         n    = bars_per_day
         path = [o]
         for i in range(n - 1):
-            # Drift toward daily close
-            drift   = (c - path[-1]) / (n - len(path))
-            noise   = (h - l) * 0.01 * np.random.randn()
-            nxt     = path[-1] + drift + noise
-            nxt     = max(l, min(h, nxt))
+            drift = (c - path[-1]) / (n - len(path))
+            noise = (h - l) * 0.01 * np.random.randn()
+            nxt   = max(l, min(h, path[-1] + drift + noise))
             path.append(nxt)
-        path[-1] = c  # force last bar to close at daily close
+        path[-1] = c
 
-        # Volume distribution: higher in morning and last hour
         vol_weights = np.ones(n)
-        vol_weights[:int(n*0.25)]  *= 1.8   # morning volume spike
-        vol_weights[-int(n*0.15):] *= 1.5   # last hour
+        vol_weights[:int(n*0.25)]  *= 1.8
+        vol_weights[-int(n*0.15):] *= 1.5
         vol_weights = vol_weights / vol_weights.sum()
         bar_vols    = (vol_weights * daily_vol).astype(int)
 
@@ -373,20 +431,13 @@ def resample_daily_to_intraday(df_daily: pd.DataFrame, tf_min: int) -> pd.DataFr
             bar_open  = path[i]
             bar_close = path[i+1] if i < n-1 else c
             bar_noise = (h - l) * 0.005
-            bar_h     = max(bar_open, bar_close) + abs(np.random.randn()) * bar_noise
-            bar_l     = min(bar_open, bar_close) - abs(np.random.randn()) * bar_noise
-            bar_h     = min(bar_h, h)
-            bar_l     = max(bar_l, l)
-
-            bar_ts = pd.Timestamp(
-                datetime(day.year, day.month, day.day, 9, 15) + timedelta(minutes=i * tf_min)
-            )
+            bar_h     = min(max(bar_open, bar_close) + abs(np.random.randn()) * bar_noise, h)
+            bar_l     = max(min(bar_open, bar_close) - abs(np.random.randn()) * bar_noise, l)
+            bar_ts    = pd.Timestamp(datetime(day.year, day.month, day.day, 9, 15) + timedelta(minutes=i * tf_min))
             rows.append({
                 "timestamp": bar_ts,
-                "open": round(bar_open, 2),
-                "high": round(bar_h,    2),
-                "low":  round(bar_l,    2),
-                "close":round(bar_close,2),
+                "open": round(bar_open, 2), "high": round(bar_h, 2),
+                "low":  round(bar_l,    2), "close":round(bar_close, 2),
                 "volume": float(bar_vols[i]),
             })
 
@@ -396,27 +447,26 @@ def resample_daily_to_intraday(df_daily: pd.DataFrame, tf_min: int) -> pd.DataFr
 
 
 # ═════════════════════════════════════════════════════════════
-# MASTER FETCHER — tries all sources in order
+# MASTER FETCHER
 # ═════════════════════════════════════════════════════════════
 def get_historical_data(
-    index:   str = "BANKNIFTY",
-    tf_min:  int = 5,
-    days:    int = 90,
-    source:  str = "auto",   # auto | openchart | nsepy | nselib | nse_rest
+    index:   str  = "BANKNIFTY",
+    tf_min:  int  = 5,
+    days:    int  = 90,
+    source:  str  = "auto",   # auto | dhan | openchart | nsepy | nselib | nse_rest
     save_csv:bool = False,
     csv_dir: str  = ".",
 ) -> pd.DataFrame:
     """
-    Master function — returns clean OHLCV DataFrame ready for backtesting.
-
-    Priority:
-      auto → openchart (5-min intraday) → nsepy daily → nselib daily → nse_rest daily
-
-    All daily sources are resampled to tf_min intraday candles.
+    Priority: dhan → openchart → nsepy → nselib → nse_rest
+    Daily sources are resampled to tf_min intraday candles.
     """
     df = pd.DataFrame()
 
-    if source in ("auto", "openchart"):
+    if source in ("auto", "dhan"):
+        df = fetch_dhan(index, tf_min, days)
+
+    if df.empty and source in ("auto", "openchart"):
         df = fetch_openchart(index, tf_min, days)
 
     if df.empty and source in ("auto", "nsepy"):
@@ -437,17 +487,12 @@ def get_historical_data(
 
     if df.empty:
         log.error("All data sources failed.")
-        log.error("Install a data source:  py -3.11 -m pip install openchart")
-        log.error("Or use CSV:             py -3.11 backtest.py --csv your_file.csv")
+        log.error("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env for best results.")
         return df
 
-    # Final clean
     df = df.sort_index()
     df = df[~df.index.duplicated(keep="first")]
-    df = df[["open","high","low","close","volume"]].astype(float)
-    df = df.dropna()
-
-    # Keep only last N days
+    df = df[["open","high","low","close","volume"]].astype(float).dropna()
     cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
     df = df[df.index >= cutoff]
 
@@ -471,34 +516,38 @@ def check_sources():
     print("  NSE Data Source Availability")
     print("="*55)
 
-    sources = {
-        "openchart": ("openchart",  "5-min intraday NFO  ← BEST for options BT"),
-        "nsepy":     ("nsepy",       "daily index OHLCV"),
-        "nselib":    ("nselib",      "daily index OHLCV"),
-        "requests":  ("requests",   "NSE REST (always available)"),
-    }
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    except Exception:
+        pass
 
-    for pkg, (imp, desc) in sources.items():
+    dhan_ok = bool(os.getenv("DHAN_CLIENT_ID") and os.getenv("DHAN_ACCESS_TOKEN"))
+    mark   = "✓" if dhan_ok else "✗"
+    status = "CONFIGURED" if dhan_ok else "NOT CONFIGURED"
+    print(f"  {mark} {'dhan':<12} {status:<16} real 5-min intraday ← BEST (set in .env)")
+
+    for pkg, desc in [
+        ("openchart", "5-min intraday NFO"),
+        ("nsepy",     "daily index OHLCV"),
+        ("nselib",    "daily index OHLCV"),
+        ("requests",  "NSE REST (always available)"),
+    ]:
         try:
-            __import__(imp)
-            status = "INSTALLED"
-            mark   = "✓"
+            __import__(pkg)
+            print(f"  ✓ {pkg:<12} {'INSTALLED':<16} {desc}")
         except ImportError:
-            status = "NOT INSTALLED"
-            mark   = "✗"
-        print(f"  {mark} {pkg:<12} {status:<16} {desc}")
+            print(f"  ✗ {pkg:<12} {'NOT INSTALLED':<16} {desc}")
 
     print()
-    print("  Install best source:")
-    print("  py -3.11 -m pip install openchart")
-    print()
-    print("  Or install all:")
-    print("  py -3.11 -m pip install openchart nsepy nselib requests")
+    print("  Best: add DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN to .env")
+    print("  Fallback: py -3.11 -m pip install openchart nsepy nselib")
     print("="*55 + "\n")
 
 
 # ═════════════════════════════════════════════════════════════
-# MAIN — standalone usage
+# MAIN
 # ═════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch real NSE historical data")
@@ -507,9 +556,9 @@ if __name__ == "__main__":
     parser.add_argument("--tf",     type=int, default=5,   help="Timeframe in minutes")
     parser.add_argument("--days",   type=int, default=90,  help="Number of days")
     parser.add_argument("--source", type=str, default="auto",
-                        choices=["auto","openchart","nsepy","nselib","nse_rest"])
-    parser.add_argument("--save",   action="store_true",   help="Save CSV for reuse")
-    parser.add_argument("--check",  action="store_true",   help="Check installed sources")
+                        choices=["auto","dhan","openchart","nsepy","nselib","nse_rest"])
+    parser.add_argument("--save",   action="store_true", help="Save CSV for reuse")
+    parser.add_argument("--check",  action="store_true", help="Check installed sources")
     args = parser.parse_args()
 
     if args.check:

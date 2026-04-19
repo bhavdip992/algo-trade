@@ -1511,3 +1511,17 @@ Ctrl+C — squaring off...
 2026-04-19 23:53:46,533 [INFO] ✅ Warmup complete — 225 bars loaded
 2026-04-19 23:53:46,534 [INFO] Weekend — waiting for Monday 9:15
 2026-04-19 23:53:55,448 [INFO] Ctrl+C — exiting
+2026-04-20 00:22:20,989 [INFO] ✅ Credentials loaded from: C:\Users\DODIYA BHAVDEEP\Desktop\auto-trade\kotak-neo-direct\..\.env
+2026-04-20 00:22:25,990 [INFO] 🔑 Logging into Kotak Neo...
+2026-04-20 00:22:25,996 [INFO] TOTP: 285686
+2026-04-20 00:22:26,115 [INFO] TOTP ✓
+2026-04-20 00:22:26,217 [INFO] MPIN ✓
+2026-04-20 00:22:26,218 [INFO] ✅ Login successful
+2026-04-20 00:22:26,886 [INFO] 🔍 Checking NIFTY option token format...
+2026-04-20 00:22:26,887 [INFO] 📚 Warmup: NIFTY 5min — need 55 bars
+2026-04-20 00:22:26,887 [INFO] Dhan: NIFTY 5min 2026-04-15 → 2026-04-20
+2026-04-20 00:22:27,015 [INFO] Dhan: fetched 225 candles
+2026-04-20 00:22:28,908 [INFO] ✅ Dhan warmup: 225 bars loaded into engine
+2026-04-20 00:22:28,909 [INFO] ✅ Warmup complete — 225 bars loaded
+2026-04-20 00:22:28,909 [INFO] ⏰ Market opens in 532m 31s
+2026-04-20 00:22:33,233 [INFO] Ctrl+C — exiting

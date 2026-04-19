@@ -99,6 +99,11 @@ except ImportError:
 socket.setdefaulttimeout(8)
 
 from signal_engine import SignalEngine, EngineConfig, SignalResult
+from telegram_notify import (
+    notify_startup, notify_trade_open, notify_trade_exit,
+    notify_sl_trail, notify_daily_summary, TelegramCommandListener,
+)
+from dhan_warmup import warmup_from_dhan
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1199,6 +1204,10 @@ def square_off(symbol: str, reason: str = "MANUAL") -> dict:
             f"| Entry ₹{pos.entry_ltp:.1f} → Exit ₹{ltp:.1f} "
             f"| P&L ₹{pnl:.0f}"
         )
+        notify_trade_exit(
+            symbol=symbol, reason=reason, entry_ltp=pos.entry_ltp,
+            exit_ltp=ltp, pnl=pnl, qty=pos.qty,
+        )
         return {"symbol": symbol, "status": reason, "pnl": round(pnl, 2), "oid": oid}
     except Exception as e:
         log.error(f"square_off failed ({symbol}): {e}")
@@ -1386,6 +1395,12 @@ def execute_trade(result: SignalResult) -> bool:
     log.info(
         f"🚀 [{mode_lbl}] TRADE OPEN: {symbol} | "
         f"{lots}L @ ₹{opt_ltp:.1f} | SL ₹{sl_prem:.1f} | Tgt ₹{tgt_prem:.1f}"
+    )
+    notify_trade_open(
+        symbol=symbol, option=option, entry_ltp=opt_ltp,
+        sl_prem=sl_prem, tgt_prem=tgt_prem, qty=qty, lots=lots,
+        cost=cost, spot=result.close, confirmations=result.confirmations,
+        reason=result.signal_reason, mode=mode_lbl,
     )
     return True
 
@@ -2058,6 +2073,7 @@ if __name__ == "__main__":
 
     # 1. Login
     sess.login()
+    notify_startup(CFG)
 
     # 1b. Diagnostics: log first search_scrip result so we can see token format
     log.info(f"🔍 Checking {CFG['index']} option token format...")
@@ -2097,6 +2113,12 @@ if __name__ == "__main__":
     # 6. TrailMonitor
     TrailMonitor(interval=5).start()
 
+    # 7. Telegram command listener
+    TelegramCommandListener(
+        get_state_fn=lambda: state,
+        square_off_all_fn=square_off_all,
+    ).start()
+
     # 7. Main loop
     log.info("✅ Running — Ctrl+C to stop")
     try:
@@ -2122,6 +2144,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log.info("\nCtrl+C — squaring off...")
         square_off_all("MANUAL")
+        notify_daily_summary(state.trades, state.pnl, state.candles)
         print()
         print(f"  ── Session Summary ──────────────────────")
         print(f"  Trades   : {state.trades}")

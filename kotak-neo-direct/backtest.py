@@ -1,26 +1,20 @@
 """
 backtest.py
 ═══════════
-Backtest the signal engine on historical Kotak Neo data.
+Backtest the signal engine using Dhan historical data.
 
-Data sources (in order of preference):
-  1. Kotak Neo historical API  (if logged in)
-  2. CSV file you provide      (--csv path/to/file.csv)
-  3. NSEpy / nsepython         (free, no login needed)
-
-Output:
-  - Terminal summary table
-  - backtest_report.html  (full trade log + equity curve + metrics)
+Data source: Dhan API (POST https://api.dhan.co/v2/charts/intraday)
+Requires DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env
 
 Usage:
-  py -3.11 backtest.py                          # Kotak Neo data
+  py -3.11 backtest.py                          # Dhan data (default)
   py -3.11 backtest.py --csv mydata.csv         # your own CSV
   py -3.11 backtest.py --days 60                # last 60 days
   py -3.11 backtest.py --index NIFTY --tf 15    # NIFTY 15-min
   py -3.11 backtest.py --optimize               # find best params
 
 Install:
-  py -3.11 -m pip install pandas numpy pyotp python-dotenv requests
+  py -3.11 -m pip install pandas numpy requests python-dotenv
 """
 
 import os, sys, json, argparse, time, logging
@@ -80,19 +74,105 @@ class Trade:
 # DATA LOADERS
 # ═════════════════════════════════════════════════════════════
 
-def load_from_kotak(index: str, tf_min: int, days: int) -> pd.DataFrame:
+def load_from_dhan(index: str, tf_min: int, days: int) -> pd.DataFrame:
     """
-    Kotak Neo API has no historical data endpoint.
-    Use nse_data.py which fetches real NSE data from multiple free sources.
+    Fetch historical OHLCV candles from Dhan API.
+    POST https://api.dhan.co/v2/charts/intraday
+    Credentials read from .env: DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
     """
-    try:
-        from nse_data import get_historical_data
-        return get_historical_data(index=index, tf_min=tf_min, days=days, source="auto")
-    except ImportError:
-        log.warning("nse_data.py not found in same folder — place nse_data.py next to backtest.py")
+    import requests
+
+    client_id    = os.getenv("DHAN_CLIENT_ID", "").strip()
+    access_token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
+
+    if not client_id or not access_token:
+        log.warning("DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN not set in .env")
         return pd.DataFrame()
+
+    DHAN_SECURITY_ID = {
+        "NIFTY": "13", "BANKNIFTY": "25",
+        "FINNIFTY": "27", "MIDCPNIFTY": "442",
+    }
+    DHAN_INTERVAL = {
+        1: "1", 3: "3", 5: "5", 10: "10",
+        15: "15", 25: "25", 60: "60"
+    }
+
+    security_id = DHAN_SECURITY_ID.get(index.upper())
+    if not security_id:
+        log.warning(f"No Dhan security ID for {index}")
+        return pd.DataFrame()
+
+    interval = DHAN_INTERVAL.get(tf_min, "5")
+    now      = datetime.now()
+    from_dt  = now - timedelta(days=days)
+
+    payload = {
+        "securityId":      security_id,
+        "exchangeSegment": "IDX_I",
+        "instrument":      "INDEX",
+        "interval":        interval,
+        "fromDate":        from_dt.strftime("%Y-%m-%d"),
+        "toDate":          now.strftime("%Y-%m-%d"),
+    }
+    headers = {
+        "access-token": access_token,
+        "client-id":    client_id,
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+    }
+
+    log.info(f"Dhan: {index} {tf_min}min {payload['fromDate']} → {payload['toDate']}")
+
+    try:
+        resp = requests.post(
+            "https://api.dhan.co/v2/charts/intraday",
+            headers=headers, json=payload, timeout=15,
+        )
+        if resp.status_code != 200:
+            log.warning(f"Dhan API {resp.status_code}: {resp.text[:200]}")
+            return pd.DataFrame()
+
+        data       = resp.json()
+        opens      = data.get("open",      [])
+        highs      = data.get("high",      [])
+        lows       = data.get("low",       [])
+        closes     = data.get("close",     [])
+        volumes    = data.get("volume",    [])
+        timestamps = data.get("timestamp", data.get("start_Time", []))
+
+        if not closes:
+            log.warning(f"Dhan returned empty data: {str(data)[:200]}")
+            return pd.DataFrame()
+
+        rows = []
+        for i in range(len(closes)):
+            try:
+                cl = float(closes[i])
+                if cl <= 0:
+                    continue
+                o  = float(opens[i])      if i < len(opens)      else cl
+                h  = float(highs[i])      if i < len(highs)      else cl
+                l  = float(lows[i])       if i < len(lows)       else cl
+                v  = float(volumes[i])    if i < len(volumes)    else 0.0
+                ts = timestamps[i]        if i < len(timestamps) else None
+                rows.append({"timestamp": ts, "open": o, "high": h,
+                             "low": l, "close": cl, "volume": v})
+            except Exception:
+                continue
+
+        df = pd.DataFrame(rows)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = df.set_index("timestamp").sort_index()
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+
+        log.info(f"Dhan: loaded {len(df)} candles "
+                 f"({df.index[0].date()} → {df.index[-1].date()})")
+        return df
+
     except Exception as e:
-        log.warning(f"nse_data fetch failed: {e}")
+        log.warning(f"Dhan request failed: {e}")
         return pd.DataFrame()
 def load_from_csv(path: str) -> pd.DataFrame:
     """
@@ -738,10 +818,10 @@ if __name__ == "__main__":
     if args.csv:
         df = load_from_csv(args.csv)
     else:
-        df = load_from_kotak(args.index, args.tf, args.days)
+        df = load_from_dhan(args.index, args.tf, args.days)
 
     if df.empty:
-        log.warning("Using synthetic data — Kotak login or CSV not available")
+        log.warning("Dhan API returned no data — using synthetic data")
         df = _generate_synthetic_data(args.index, args.tf, max(args.days, 90))
 
     # ── Config ──
